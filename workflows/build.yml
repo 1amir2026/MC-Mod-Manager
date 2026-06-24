@@ -1,0 +1,38 @@
+name: Build Binaries
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install pyinstaller requests packaging
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        run: pyinstaller --onefile --console --name MCModManager --icon=icon1.ico mc_mod_manager_cli.py
+
+      - name: Build (Linux / macOS)
+        if: runner.os != 'Windows'
+        run: pyinstaller --onefile --console --name MCModManager mc_mod_manager_cli.py
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MCModManager-${{ runner.os }}
+          path: dist/
