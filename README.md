@@ -41,22 +41,163 @@ Dependencies are installed automatically on first run. If the primary PyPI index
 
 ---
 
-## Usage
+## Windows Security Warning
 
+When running the executable for the first time, Windows SmartScreen may
+display a blue warning screen ("Windows protected your PC"). This happens
+because the binary is not code-signed.
+
+To proceed:
+1. Click "More info"
+2. Click "Run anyway"
+
+This is expected behavior for unsigned open-source executables.
+The source code is fully available in this repository for review.
+
+---
+
+## Usage Guide
+
+This guide covers two ways to use MC Mod Manager: running the prebuilt binary, or running from source with Python.
+
+---
+
+### Option 1 — Prebuilt Binary (Recommended)
+
+No Python or any other software required.
+
+**Step 1.** Go to the [Releases](https://github.com/1amir2026/MC-Mod-Manager/releases/latest) page and download the file for your platform:
+
+| Platform | File |
+|----------|------|
+| Windows 64-bit | MCModManager-Windows-x64.exe |
+| Linux 64-bit | MCModManager-Linux-x64 |
+| macOS 64-bit | MCModManager-macOS-x64 |
+
+**Step 2.** Run the file.
+
+Windows:
+```
+Double-click MCModManager-Windows-x64.exe
+```
+If Windows SmartScreen shows a blue warning, click More info then Run anyway.
+
+Linux / macOS:
+```bash
+chmod +x MCModManager-Linux-x64
+./MCModManager-Linux-x64
+```
+
+macOS only: If Gatekeeper blocks the file, run this once:
+```bash
+xattr -d com.apple.quarantine ./MCModManager-macOS-x64
+```
+
+---
+
+### Option 2 — Run from Source with Python
+
+Requires Python 3.8 or later. Download from https://python.org.
+
+**Step 1.** Clone the repository:
+```bash
+git clone https://github.com/1amir2026/MC-Mod-Manager.git
+cd MC-Mod-Manager
+```
+
+**Step 2.** Install dependencies:
+```bash
+pip install requests packaging
+```
+
+**Step 3.** Run:
 ```bash
 python mc_mod_manager_cli.py
 ```
 
-Or, if you have a compiled binary:
+Dependencies are also installed automatically on first run if missing.
+
+---
+
+### Option 3 — Build the Binary Yourself
+
+If you want to compile your own executable from source:
 
 ```bash
-# Linux / macOS
-chmod +x MCModManager
-./MCModManager
-
-# Windows
-MCModManager.exe
+pip install pyinstaller requests packaging
+pyinstaller --onefile --console --name MCModManager mc_mod_manager_cli.py
 ```
+
+Output will be in the `dist/` folder.
+
+Windows only — to include a custom icon:
+```bash
+pyinstaller --onefile --console --name MCModManager --icon=icon1.ico mc_mod_manager_cli.py
+```
+
+---
+
+### Workflow
+
+Once started, the tool guides you through six steps:
+
+```
+Step 1  Select your Minecraft folder
+        The default .minecraft path is detected automatically.
+        You can confirm it or enter a custom path.
+
+Step 2  Select target Minecraft version
+        Choose from a list fetched from Modrinth,
+        or type a version manually (e.g. 1.21.4).
+
+Step 3  Select mod loader
+        Choose from Fabric, Forge, NeoForge, or Quilt.
+
+Step 4  Scan and check
+        The tool scans your mods folder and queries Modrinth
+        for each mod. Results are shown as:
+          update available  -- a newer version exists for your target
+          up-to-date        -- already on the latest version
+          not found         -- mod is not available on Modrinth
+
+Step 5  Confirm
+        Review the full list and confirm before any files are written.
+
+Step 6  Download
+        Each mod is downloaded one by one with a progress bar.
+        A new folder is created at:
+        .minecraft/MC_{version}_{loader}/mods/
+        Your existing mods folder is never modified.
+```
+
+---
+
+### Output Structure
+
+After a successful run:
+
+```
+.minecraft/
++-- MC_1.21.4_Fabric/
+    +-- mods/
+    |   +-- sodium-fabric-0.6.3+mc1.21.4.jar
+    |   +-- lithium-fabric-0.13.0+mc1.21.4.jar
+    |   +-- ...
+    +-- log_20250623_183000.txt
+```
+
+---
+
+### Troubleshooting
+
+| Issue | Resolution |
+|-------|------------|
+| Mod not found | The mod may only be on CurseForge. Download it manually. |
+| Windows blue screen on launch | Click More info then Run anyway. |
+| macOS blocked by Gatekeeper | Run: xattr -d com.apple.quarantine ./MCModManager-macOS-x64 |
+| Network error | Check your connection. The tool retries automatically. |
+| Wrong version downloaded | Make sure your selected loader matches the mods in your folder. |
+| pip cannot reach PyPI | The tool retries with a fallback mirror automatically. |
 
 ---
 
