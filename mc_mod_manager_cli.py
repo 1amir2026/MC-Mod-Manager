@@ -1,15 +1,12 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-MC Mod Manager v4.0
-Minecraft Mod Manager - CLI Edition
+1amir2026 GOD lol
 """
 
 import os, sys, json, time, shutil, hashlib, zipfile, re, platform
 from pathlib import Path
 from datetime import datetime
 
-# ── Auto-install dependencies ──────────────────────────────────────────────────
+# install something if needed (if)
 def _install(pkg, mirror=False):
     import subprocess
     index = " --index-url https://mirror-pypi.runflare.com/simple/" if mirror else ""
@@ -32,12 +29,12 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from packaging.version import Version
 
-# ── Constants ──────────────────────────────────────────────────────────────────
+# something
 APP_VER  = "4.0.0"
 MODRINTH = "https://api.modrinth.com/v2"
 LOADERS  = ["Fabric", "Forge", "NeoForge", "Quilt"]
 
-# ── Terminal helpers ───────────────────────────────────────────────────────────
+# helpers
 
 def clr():
     os.system("cls" if platform.system() == "Windows" else "clear")
@@ -109,7 +106,7 @@ def fmt_size(b):
         b /= 1024
     return f"{b:.1f}TB"
 
-# ── Mod metadata scanner ───────────────────────────────────────────────────────
+# scan mod ( moddata )
 
 class Mod:
     __slots__ = ("filename", "path", "name", "mod_id", "version", "mc_versions",
@@ -206,7 +203,7 @@ def scan_mods(folder):
             mods.append(parse_jar(os.path.join(scan_path, f)))
     return mods
 
-# ── Modrinth API ───────────────────────────────────────────────────────────────
+# api modrinth
 
 class Modrinth:
     def __init__(self, sess):
@@ -309,7 +306,7 @@ def download_file(sess, url, dest):
         print()
         return str(e)
 
-# ── Logger ─────────────────────────────────────────────────────────────────────
+# -
 
 class Logger:
     def __init__(self):
@@ -336,9 +333,8 @@ class Logger:
         except:
             pass
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Main App  -  Linear wizard flow
-# ══════════════════════════════════════════════════════════════════════════════
+# main
+
 
 class App:
     def __init__(self):
@@ -350,7 +346,7 @@ class App:
         self.mr     = Modrinth(self.sess)
         self.log    = Logger()
 
-    # ── Entry point ───────────────────────────────────────────────────────────
+    # entry point
     def run(self):
         clr()
         banner("Minecraft Mod Manager")
@@ -367,7 +363,7 @@ class App:
         self._step_confirm()
         self._step_download()
 
-    # ── Step 1: Folder ────────────────────────────────────────────────────────
+    # select folder ( step 1 xd ) 
     def _step_folder(self):
         clr()
         banner("Step 1 of 4 -- Select Minecraft Folder")
@@ -405,7 +401,7 @@ class App:
 
         pause()
 
-    # ── Step 2: MC Version ────────────────────────────────────────────────────
+    # check mc versions and ask to select one ( want to update to ) ( step 2 )
     def _step_version(self):
         clr()
         banner("Step 2 of 4 -- Select Target Minecraft Version")
@@ -442,7 +438,7 @@ class App:
 
         pause()
 
-    # ── Step 3: Loader ────────────────────────────────────────────────────────
+    # loader ( fabric forge and etc )
     def _step_loader(self):
         clr()
         banner("Step 3 of 4 -- Select Mod Loader")
@@ -465,7 +461,7 @@ class App:
 
         pause()
 
-    # ── Step 4: Scan ──────────────────────────────────────────────────────────
+    # scan but in step 4 ( mod scan not etc )
     def _step_scan(self):
         clr()
         banner("Step 4 of 4 -- Scanning Mods Folder")
@@ -525,7 +521,7 @@ class App:
         print()
         pause()
 
-    # ── Step 5: Confirm ───────────────────────────────────────────────────────
+    # confirm by user to continue ( update and download )
     def _step_confirm(self):
         clr()
         banner("Confirm Download")
@@ -568,7 +564,7 @@ class App:
             warn("Aborted.")
             sys.exit(0)
 
-    # ── Step 6: Download ──────────────────────────────────────────────────────
+    # download all
     def _step_download(self):
         clr()
         banner("Downloading Mods")
@@ -639,7 +635,7 @@ class App:
         pause()
 
 
-# ── Entry ──────────────────────────────────────────────────────────────────────
+# entry ( last )
 if __name__ == "__main__":
     try:
         App().run()
