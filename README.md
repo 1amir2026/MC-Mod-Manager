@@ -1,6 +1,6 @@
 # MC Mod Manager
 
-**Minecraft Mod Manager -- CLI Edition**
+**Minecraft Mod Manager - CLI LOL**
 
 [![Python](https://img.shields.io/badge/Python-3.8%2B-blue)](https://python.org)
 [![Modrinth](https://img.shields.io/badge/Powered%20by-Modrinth-green)](https://modrinth.com)
