@@ -281,7 +281,7 @@ class Modrinth:
         mod.project_id = pid
         return self.latest(pid, game_ver, loader)
 
-# ── Download ───────────────────────────────────────────────────────────────────
+# DOWNLOAD
 
 def download_file(sess, url, dest):
     try:
