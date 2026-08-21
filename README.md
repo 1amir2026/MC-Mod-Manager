@@ -11,6 +11,8 @@
 
 A command-line tool for scanning, version-checking, and downloading Minecraft mods from [Modrinth](https://modrinth.com). not hard, usable and esay-to-use ( i know you thanks me a lot )
 
+> yeah. not install mods from CurseForge  ( use your hand ) 
+
 ---
 
 ## Features
