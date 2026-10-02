@@ -2,8 +2,8 @@
 1amir2026 GOD lol
 """
 
-import os, sys, json, time, shutil, hashlib, zipfile, re, platform, struct, threading, traceback, math
-from difflib import SequenceMatcher
+import builtins, os, sys, json, time, shutil, hashlib, zipfile, re, platform, struct, threading, traceback, math
+from difflib import SequenceMatcher, get_close_matches
 from pathlib import Path
 from datetime import datetime
 from urllib.parse import quote
@@ -159,6 +159,45 @@ def enable_ansi():
         return False
 
 
+def smooth_console():
+    """Best effort: UTF-8 output and a smooth TrueType console font (Consolas) on Windows.
+    Windows Terminal ignores the font part and uses its own font setting."""
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+    if platform.system() != "Windows" or not sys.stdout.isatty():
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class COORD(ctypes.Structure):
+            _fields_ = [("X", ctypes.c_short), ("Y", ctypes.c_short)]
+
+        class FONTINFOEX(ctypes.Structure):
+            _fields_ = [("cbSize", ctypes.c_ulong), ("nFont", ctypes.c_ulong),
+                        ("dwFontSize", COORD), ("FontFamily", ctypes.c_uint),
+                        ("FontWeight", ctypes.c_uint), ("FaceName", ctypes.c_wchar * 32)]
+
+        k = ctypes.windll.kernel32
+        k.GetStdHandle.restype = wintypes.HANDLE
+        h = k.GetStdHandle(-11)
+        fi = FONTINFOEX()
+        fi.cbSize = ctypes.sizeof(FONTINFOEX)
+        if not k.GetCurrentConsoleFontEx(h, False, ctypes.byref(fi)):
+            return
+        if fi.FaceName in ("Consolas", "Cascadia Mono", "Cascadia Code", "Lucida Console"):
+            return
+        fi.FaceName = "Consolas"
+        fi.FontFamily = 54
+        fi.FontWeight = 400
+        fi.dwFontSize = COORD(0, max(fi.dwFontSize.Y, 18))
+        k.SetCurrentConsoleFontEx(h, False, ctypes.byref(fi))
+    except Exception:
+        pass
+
+
 def fmt_size(b):
     for u in ["B", "KB", "MB", "GB"]:
         if b < 1024:
@@ -216,8 +255,8 @@ class Live:
         w = self.width()
         lines = []
         if self.progress:
-            lines.append(self.progress[:w])
-        lines.append(f"  [i] [{fmt_dur(self.elapsed())}]"[:w])
+            lines.append(colorize(self.progress[:w]))
+        lines.append(colorize(f"  [i] [{fmt_dur(self.elapsed())}]"[:w]))
         return lines
 
     def _erase(self):
@@ -329,16 +368,77 @@ def err(msg):   out(f"  [x] {msg}")
 
 def prompt(text):
     try:
-        return input(f"\n  > {text}").strip()
+        return input(colorize(f"\n  > {text}")).strip()
     except (KeyboardInterrupt, EOFError):
         print()
         sys.exit(0)
 
-def pause():
+_COLOR = sys.stdout.isatty() and enable_ansi()
+
+def yellow(text):
+    return f"\033[93m{text}\033[0m" if _COLOR else text
+
+_BRACKET = re.compile(r"\[[^\[\]\x1b]*\]")
+
+def colorize(text):
+    """Makes every [bracketed] tag yellow (only on terminals that support colors)."""
+    if not _COLOR or not isinstance(text, str) or "\x1b" in text:
+        return text
+    return _BRACKET.sub(lambda m: f"\x1b[93m{m.group(0)}\x1b[0m", text)
+
+_builtin_print = builtins.print
+
+def print(*args, **kwargs):
+    _builtin_print(*[colorize(a) for a in args], **kwargs)
+
+def read_key(allow_esc=True):
+    """Waits for Enter or Esc without echoing. Returns 'enter' or 'esc'.
+    Arrow keys and other keys are ignored. Falls back to input() if stdin is not a terminal."""
+    if not sys.stdin.isatty():
+        input()
+        return "enter"
+    if platform.system() == "Windows":
+        import msvcrt
+        while True:
+            ch = msvcrt.getwch()
+            if ch in ("\r", "\n"):
+                return "enter"
+            if ch == "\x03":
+                raise KeyboardInterrupt
+            if ch == "\x1b" and allow_esc:
+                return "esc"
+            if ch in ("\x00", "\xe0"):
+                msvcrt.getwch()  # second half of an arrow/function key
+    import termios, tty, select
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
     try:
-        input("\n  Press Enter to continue...")
+        tty.setcbreak(fd)
+        while True:
+            ch = os.read(fd, 1).decode("utf-8", "ignore")
+            if ch in ("\r", "\n"):
+                return "enter"
+            if ch == "\x1b":
+                if select.select([fd], [], [], 0.05)[0]:
+                    while select.select([fd], [], [], 0.02)[0]:
+                        os.read(fd, 1)  # arrow key sequence, ignore it
+                    continue
+                if allow_esc:
+                    return "esc"
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+def pause(esc=False, text="Press Enter to continue..."):
+    """Yellow 'Press Enter' line. With esc=True also offers Esc and returns True if it was pressed."""
+    sys.stdout.write("\n" + yellow("  " + text + (" (Esc to edit)" if esc else "")))
+    sys.stdout.flush()
+    try:
+        key = read_key(allow_esc=esc)
     except (KeyboardInterrupt, EOFError):
+        print()
         sys.exit(0)
+    print()
+    return key == "esc"
 
 def get_default_mc():
     s = platform.system()
@@ -798,6 +898,7 @@ def pick_modrinth_version(versions):
 
 class ModrinthProvider(Provider):
     name = "Modrinth"
+    versions_live = True
 
     @staticmethod
     def loaders_for(loader):
@@ -809,7 +910,9 @@ class ModrinthProvider(Provider):
         if isinstance(data, list):
             vers = [v["version"] for v in data if v.get("version_type") == "release"]
             if vers:
+                self.versions_live = True
                 return vers
+        self.versions_live = False
         LOG.warn("Using built-in Minecraft version list")
         return ["1.21.4", "1.21.3", "1.21.1", "1.21", "1.20.6", "1.20.4",
                 "1.20.1", "1.20", "1.19.4", "1.19.2", "1.19", "1.18.2",
@@ -1159,6 +1262,7 @@ class App:
         self.mr        = ModrinthProvider(self.http)
         self.providers = [self.mr]
         self.t_start   = time.monotonic()
+        self._ver_list = None
         LOG.info(f"Session started, app v{APP_VER}")
 
     def run(self):
@@ -1171,10 +1275,15 @@ class App:
         sep()
 
         self._setup_sources()
-        self._step_folder()
-        self._step_version()
-        self._step_loader()
-        self._step_scan()
+
+        # Each step returns None (go on), "edit" (Esc: redo this step) or "version" (go back to step 2).
+        steps = [self._step_folder, self._step_version, self._step_loader, self._step_scan]
+        i = 0
+        while i < len(steps):
+            result = steps[i]()
+            if result == "edit":
+                continue
+            i = 1 if result == "version" else i + 1
         self._step_confirm()
         self._step_download()
 
@@ -1209,11 +1318,7 @@ class App:
         out("  Full log located at:")
         out(f"  {log_path}")
         print()
-        try:
-            input("  Press Enter to skip for now...")
-        except (KeyboardInterrupt, EOFError):
-            print()
-            sys.exit(0)
+        pause(text="Press Enter to skip for now...")
 
     def _startup_log_path(self):
         """Creates a log file right away and returns its path (or a note if it can't be written)."""
@@ -1241,7 +1346,10 @@ class App:
         sep()
 
         while True:
-            ch = prompt("Enter choice [1/2]:")
+            ch = prompt("Enter choice [1/2]:" if not self.folder else "Enter choice [1/2] (Enter = keep current):")
+            if not ch and self.folder:
+                ok(f"Using: {self.folder}")
+                break
             if ch == "1":
                 if os.path.isdir(default):
                     self.folder = default
@@ -1265,41 +1373,57 @@ class App:
                 warn("Please enter 1 or 2.")
 
         LOG.context["Minecraft folder"] = self.folder
-        pause()
+        if pause(esc=True):
+            return "edit"
 
     def _step_version(self):
         clr()
         banner("Step 2 of 4 -- Select Target Minecraft Version")
         print()
-        info("Fetching version list from Modrinth...")
-        ver_list = self.mr.mc_versions()
+        if self._ver_list is None:
+            info("Fetching version list from Modrinth...")
+            self._ver_list = self.mr.mc_versions()
+        ver_list = self._ver_list
         print()
 
         top = ver_list[:20]
         for i, v in enumerate(top, 1):
             print(f"  [{i:>2}]  {v}")
         print()
-        print("  Or type any version manually (e.g. 1.21.4)")
+        print("  Or type any real Minecraft release (e.g. 1.21.4)")
+        if not self.mr.versions_live:
+            warn("Live version list unavailable, only built-in versions are accepted.")
+        if self.ver:
+            print(f"  Current: {self.ver} (press Enter to keep it)")
         sep()
 
         while True:
             ch = prompt("Enter number or version string:")
-            try:
+            if not ch and self.ver:
+                ok(f"Target version: {self.ver}")
+                break
+            if ch.isdigit():
                 idx = int(ch) - 1
                 if 0 <= idx < len(top):
                     self.ver = top[idx]
                     ok(f"Target version: {self.ver}")
                     break
-            except ValueError:
-                pass
-            if re.match(r"^\d+\.\d+", ch):
-                self.ver = ch
+                warn(f"Pick a number between 1 and {len(top)}, or type a version like 1.21.4")
+                continue
+            match = next((v for v in ver_list if v.lower() == ch.lower()), None)
+            if match:
+                self.ver = match
                 ok(f"Target version: {self.ver}")
                 break
-            warn("Invalid input. Enter a number from the list or a version like 1.21.4")
+            warn(f"'{ch}' is not a real Minecraft release version.")
+            LOG.warn(f"Rejected version input: {ch!r}")
+            close = get_close_matches(ch, ver_list, n=3, cutoff=0.5)
+            if close:
+                info("Did you mean: " + ", ".join(close) + " ?")
 
         LOG.context["Target version"] = self.ver
-        pause()
+        if pause(esc=True):
+            return "edit"
 
     def _step_loader(self):
         clr()
@@ -1310,7 +1434,10 @@ class App:
         sep()
 
         while True:
-            ch = prompt("Enter choice [1-4]:")
+            ch = prompt("Enter choice [1-4]:" if not self.loader else "Enter choice [1-4] (Enter = keep current):")
+            if not ch and self.loader:
+                ok(f"Loader: {self.loader}")
+                break
             try:
                 idx = int(ch) - 1
                 if 0 <= idx < len(LOADERS):
@@ -1323,7 +1450,8 @@ class App:
 
         LOG.context["Loader"] = self.loader
         LOG.context["Sources"] = ", ".join(p.name for p in self.providers)
-        pause()
+        if pause(esc=True):
+            return "edit"
 
     def _step_scan(self):
         clr()
@@ -1384,7 +1512,9 @@ class App:
             info("Found via: " + ", ".join(f"{k} {v}" for k, v in via.items()))
         LOG.info(f"Resolve summary: {counts} via={via} in {time.monotonic() - t_scan:.1f}s")
         print()
-        pause()
+        if pause(esc=True):
+            LOG.info("User pressed Esc after scan, going back to version selection")
+            return "version"
 
     def _resolve(self, m):
         started = time.monotonic()
@@ -1725,6 +1855,7 @@ class App:
 
 
 def main():
+    smooth_console()
     try:
         App().run()
     except KeyboardInterrupt:
