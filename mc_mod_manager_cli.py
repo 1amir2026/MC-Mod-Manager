@@ -2,24 +2,26 @@
 1amir2026 GOD lol
 """
 
-import os, sys, json, time, shutil, hashlib, zipfile, re, platform
+import os, sys, json, time, shutil, hashlib, zipfile, re, platform, struct, threading, traceback, math
+from difflib import SequenceMatcher
 from pathlib import Path
 from datetime import datetime
+from urllib.parse import quote
 
-# install something if needed (if)
+
 def _install(pkg, mirror=False):
     import subprocess
     index = " --index-url https://mirror-pypi.runflare.com/simple/" if mirror else ""
     cmd = f"{sys.executable} -m pip install {pkg}{index} --quiet"
     return subprocess.run(cmd, shell=True).returncode == 0
 
-for _pkg in ["requests", "packaging"]:
+for _pkg in ["requests"]:
     try:
         __import__(_pkg)
     except ImportError:
         print(f"  Installing {_pkg}...")
         if not _install(_pkg):
-            print(f"  Retrying with mirror...")
+            print("  Retrying with mirror...")
             if not _install(_pkg, mirror=True):
                 print(f"  ERROR: Could not install {_pkg}. Please run: pip install {_pkg}")
                 sys.exit(1)
@@ -27,17 +29,283 @@ for _pkg in ["requests", "packaging"]:
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from packaging.version import Version
 
-# something
-APP_VER  = "4.0.0"
-MODRINTH = "https://api.modrinth.com/v2"
-LOADERS  = ["Fabric", "Forge", "NeoForge", "Quilt"]
+APP_VER    = "5.0.0"
+MODRINTH   = "https://api.modrinth.com/v2"
+CURSEFORGE = "https://api.curseforge.com/v1"
+LOADERS    = ["Fabric", "Forge", "NeoForge", "Quilt"]
 
-# helpers
+CF_GAME_ID    = 432
+CF_CLASS_MODS = 6
+CF_LOADER_IDS = {"forge": 1, "fabric": 4, "quilt": 5, "neoforge": 6}
+CF_LOADER_TAG = {"forge": "Forge", "fabric": "Fabric", "quilt": "Quilt", "neoforge": "NeoForge"}
+
+CONFIG_PATH     = Path.home() / ".mc_mod_manager.json"
+
+# The CurseForge key is NOT stored in this file. The release build generates
+# _cf_secret.py from a GitHub secret (see make_secret.py / build.yml).
+try:
+    from _cf_secret import _A as _CF_A, _B as _CF_B
+except ImportError:
+    _CF_A = _CF_B = ""
+
+
+def get_curseforge_key():
+    """Returns (key, origin). Origin is only ever used for logging, never the key."""
+    try:
+        import base64
+        pad, blob = base64.b64decode(_CF_A), base64.b64decode(_CF_B)
+        if pad and blob:
+            key = bytes(b ^ pad[i % len(pad)] for i, b in enumerate(blob)).decode("utf-8").strip()
+            if key:
+                return key, "embedded"
+    except Exception:
+        pass
+    # Developer convenience when running from source; never prompts the user.
+    key = os.environ.get("CURSEFORGE_API_KEY", "").strip()
+    if key:
+        return key, "environment (dev)"
+    return "", "none"
+MATCH_THRESHOLD = 0.72
+DL_ATTEMPTS     = 3
+STOP_WORDS      = {"the", "a", "an", "of", "for", "and", "mod"}
+
+
+class Logger:
+    def __init__(self):
+        self._buffer = []
+        self._all = []
+        self._fh = None
+        self._lock = threading.Lock()
+        self.path = None
+        self.context = {}
+        self.counts = {"DEBUG": 0, "INFO": 0, "WARN": 0, "ERROR": 0}
+
+    def log(self, msg, level="INFO"):
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        lines = str(msg).splitlines() or [""]
+        text = f"{ts} [{level:<5}] {lines[0]}"
+        if len(lines) > 1:
+            text += "\n" + "\n".join(" " * 32 + ln for ln in lines[1:])
+        with self._lock:
+            self.counts[level] = self.counts.get(level, 0) + 1
+            self._all.append(text)
+            if self._fh:
+                self._write(text)
+
+    def debug(self, msg): self.log(msg, "DEBUG")
+    def info(self, msg):  self.log(msg, "INFO")
+    def warn(self, msg):  self.log(msg, "WARN")
+    def error(self, msg): self.log(msg, "ERROR")
+
+    def _write(self, text):
+        try:
+            self._fh.write(text + "\n")
+            self._fh.flush()
+        except OSError:
+            pass
+
+    def set_path(self, path):
+        with self._lock:
+            if self._fh:
+                try:
+                    self._fh.close()
+                except OSError:
+                    pass
+                self._fh = None
+            try:
+                fh = open(path, "w", encoding="utf-8")
+            except OSError:
+                return False
+            self._fh = fh
+            self.path = path
+            self._write(f"MC Mod Manager v{APP_VER}")
+            self._write(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            self._write(f"Python: {platform.python_version()} on {platform.platform()}")
+            self._write(f"requests: {requests.__version__}")
+            for k, v in self.context.items():
+                self._write(f"{k}: {v}")
+            self._write("=" * 72)
+            for text in self._all:
+                self._write(text)
+        return True
+
+    def section(self, title):
+        self.log("", "INFO")
+        self.log(f"===== {title} =====", "INFO")
+
+    def close(self):
+        with self._lock:
+            if self._fh:
+                try:
+                    self._fh.close()
+                except OSError:
+                    pass
+                self._fh = None
+
+
+def enable_ansi():
+    if platform.system() != "Windows":
+        return True
+    try:
+        import ctypes
+        kernel = ctypes.windll.kernel32
+        handle = kernel.GetStdHandle(-11)
+        mode = ctypes.c_ulong()
+        if not kernel.GetConsoleMode(handle, ctypes.byref(mode)):
+            return False
+        return bool(kernel.SetConsoleMode(handle, mode.value | 0x0004))
+    except Exception:
+        return False
+
+
+def fmt_size(b):
+    for u in ["B", "KB", "MB", "GB"]:
+        if b < 1024:
+            return f"{b:.1f}{u}"
+        b /= 1024
+    return f"{b:.1f}TB"
+
+def fmt_dur(seconds):
+    s = int(seconds)
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    if h:
+        return f"{h}h{m:02d}m{sec:02d}s"
+    if m:
+        return f"{m}m{sec:02d}s"
+    return f"{sec}s"
+
+def fmt_took(seconds):
+    return f"{seconds:.1f}s" if seconds < 10 else fmt_dur(seconds)
+
+
+class Live:
+    def __init__(self):
+        self.enabled = sys.stdout.isatty() and enable_ansi()
+        self.active = False
+        self.t0 = None
+        self.progress = None
+        self.drawn = 0
+        self.last_draw = 0.0
+        self.stopped_at = None
+        self.skipped = 0.0
+        self.lock = threading.RLock()
+        self.stop_evt = threading.Event()
+        self.thread = None
+
+    def width(self):
+        return max(20, shutil.get_terminal_size((80, 20)).columns - 1)
+
+    def reset(self):
+        self.t0 = time.monotonic()
+        self.skipped = 0.0
+        self.stopped_at = None
+
+    def elapsed(self):
+        if not self.t0:
+            return 0.0
+        now = self.stopped_at if self.stopped_at else time.monotonic()
+        return now - self.t0 - self.skipped
+
+    def _w(self, text):
+        sys.stdout.write(text)
+        sys.stdout.flush()
+
+    def _lines(self):
+        w = self.width()
+        lines = []
+        if self.progress:
+            lines.append(self.progress[:w])
+        lines.append(f"  [i] [{fmt_dur(self.elapsed())}]"[:w])
+        return lines
+
+    def _erase(self):
+        if not self.drawn:
+            return
+        self._w("\r\x1b[2K" + "\x1b[1A\x1b[2K" * (self.drawn - 1) + "\r")
+        self.drawn = 0
+
+    def _draw(self, lines):
+        self._w("\n".join(lines))
+        self.drawn = len(lines)
+
+    def _refresh(self):
+        lines = self._lines()
+        if len(lines) != self.drawn:
+            self._erase()
+            self._draw(lines)
+            return
+        buf = f"\x1b[{self.drawn - 1}A" if self.drawn > 1 else ""
+        buf += "\r" + "\n".join("\x1b[2K" + ln for ln in lines)
+        self._w(buf)
+
+    def _run(self):
+        while not self.stop_evt.wait(0.5):
+            with self.lock:
+                if self.active and self.enabled:
+                    self._refresh()
+
+    def start(self):
+        with self.lock:
+            if self.t0 is None:
+                self.t0 = time.monotonic()
+            if self.stopped_at:
+                self.skipped += time.monotonic() - self.stopped_at
+                self.stopped_at = None
+            self.active = True
+            self.progress = None
+            if self.enabled:
+                self._draw(self._lines())
+                self.stop_evt.clear()
+                self.thread = threading.Thread(target=self._run, daemon=True)
+                self.thread.start()
+
+    def stop(self):
+        with self.lock:
+            if not self.active:
+                return
+            self.active = False
+            self.progress = None
+            final = self.elapsed()
+            self.stopped_at = time.monotonic()
+            if self.enabled:
+                self._erase()
+        self.stop_evt.set()
+        if self.thread:
+            self.thread.join(timeout=2)
+            self.thread = None
+        print(f"  [i] [{fmt_dur(final)}]", flush=True)
+
+    def set_progress(self, text):
+        with self.lock:
+            self.progress = text
+            if not (self.active and self.enabled):
+                return
+            now = time.monotonic()
+            if text is None or now - self.last_draw >= 0.1:
+                self.last_draw = now
+                self._refresh()
+
+    def emit(self, msg):
+        with self.lock:
+            if self.active and self.enabled:
+                self._erase()
+                print(msg, flush=True)
+                self._draw(self._lines())
+            else:
+                print(msg, flush=True)
+
+
+LOG  = Logger()
+LIVE = Live()
+
 
 def clr():
     os.system("cls" if platform.system() == "Windows" else "clear")
+
+def out(msg=""):
+    LIVE.emit(msg)
 
 def banner(subtitle=""):
     w = 66
@@ -52,12 +320,12 @@ def banner(subtitle=""):
     print("+" + "-" * w + "+")
 
 def sep(char="-", w=68):
-    print(char * w)
+    out(char * w)
 
-def info(msg):  print(f"  [i] {msg}")
-def ok(msg):    print(f"  [+] {msg}")
-def warn(msg):  print(f"  [!] {msg}")
-def err(msg):   print(f"  [x] {msg}")
+def info(msg):  out(f"  [i] {msg}")
+def ok(msg):    out(f"  [+] {msg}")
+def warn(msg):  out(f"  [!] {msg}")
+def err(msg):   out(f"  [x] {msg}")
 
 def prompt(text):
     try:
@@ -82,97 +350,206 @@ def get_default_mc():
 
 def make_session():
     s = requests.Session()
-    r = Retry(total=4, backoff_factor=0.6, status_forcelist=[429, 500, 502, 503, 504])
+    kwargs = dict(total=4, backoff_factor=0.6, status_forcelist=[429, 500, 502, 503, 504])
+    try:
+        r = Retry(allowed_methods=frozenset({"GET", "POST"}), **kwargs)
+    except TypeError:
+        r = Retry(method_whitelist=frozenset({"GET", "POST"}), **kwargs)
     a = HTTPAdapter(max_retries=r)
     s.mount("http://", a)
     s.mount("https://", a)
     s.headers["User-Agent"] = f"MCModManager/{APP_VER}"
     return s
 
-def compute_sha512(path):
-    h = hashlib.sha512()
+def load_config():
+    try:
+        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+def save_config(cfg):
+    try:
+        CONFIG_PATH.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    except OSError as e:
+        LOG.warn(f"Could not save config {CONFIG_PATH}: {e}")
+        return False
+    try:
+        os.chmod(CONFIG_PATH, 0o600)
+    except OSError:
+        pass
+    return True
+
+def file_hashes(path):
+    h512 = hashlib.sha512()
+    h1 = hashlib.sha1()
+    try:
+        with open(path, "rb") as f:
+            while chunk := f.read(65536):
+                h512.update(chunk)
+                h1.update(chunk)
+    except OSError as e:
+        LOG.error(f"Could not hash {path}: {e}")
+        return "", ""
+    return h512.hexdigest(), h1.hexdigest()
+
+def hash_file(path, algo):
+    h = hashlib.new(algo)
     try:
         with open(path, "rb") as f:
             while chunk := f.read(65536):
                 h.update(chunk)
-    except:
-        pass
+    except OSError:
+        return ""
     return h.hexdigest()
 
-def fmt_size(b):
-    for u in ["B", "KB", "MB", "GB"]:
-        if b < 1024:
-            return f"{b:.1f}{u}"
-        b /= 1024
-    return f"{b:.1f}TB"
+def cf_fingerprint(data):
+    data = data.translate(None, b"\t\n\r ")
+    n = len(data)
+    m = 0x5BD1E995
+    mask = 0xFFFFFFFF
+    h = (1 ^ n) & mask
+    words = n // 4
+    for (k,) in struct.iter_unpack("<I", data[:words * 4]):
+        k = (k * m) & mask
+        k ^= k >> 24
+        k = (k * m) & mask
+        h = (h * m) & mask
+        h ^= k
+    tail = data[words * 4:]
+    rem = n & 3
+    if rem == 3:
+        h ^= tail[2] << 16
+    if rem >= 2:
+        h ^= tail[1] << 8
+    if rem >= 1:
+        h ^= tail[0]
+        h = (h * m) & mask
+    h ^= h >> 13
+    h = (h * m) & mask
+    h ^= h >> 15
+    return h
 
-# scan mod ( moddata )
+def safe_filename(name):
+    name = Path(str(name).replace("\\", "/")).name
+    name = re.sub(r'[<>:"|?*\x00-\x1f]', "_", name).strip(" .")
+    return name or "mod.jar"
+
 
 class Mod:
-    __slots__ = ("filename", "path", "name", "mod_id", "version", "mc_versions",
-                 "loader", "desc", "sha512", "project_id", "new_version",
-                 "new_url", "status")
-
     def __init__(self):
-        for s in self.__slots__:
-            setattr(self, s, "")
+        self.filename = ""
+        self.path = ""
+        self.name = ""
+        self.mod_id = ""
+        self.version = ""
+        self.desc = ""
+        self.loader = ""
+        self.sha512 = ""
+        self.sha1 = ""
+        self.size = 0
         self.mc_versions = []
+        self.authors = []
+        self.fingerprint = None
+        self.hits = {}
         self.status = "pending"
+        self.found = None
+        self.no_build = None
+        self.closest = None
+        self.dl = "pending"
+        self.dest = ""
+        self.error = ""
+        self.retryable = False
+        self.attempts = 0
+        self.retry_rounds = 0
+        self.elapsed = 0.0
+
+
+_VERSION_TAIL = re.compile(r"[-_ .]+(?:fabric|forge|neoforge|quilt|mc[\d.]+|v?\d[\w.]*)$", re.I)
 
 def _stem_clean(filename):
-    s = Path(filename).stem
-    s = re.sub(r"[-_](fabric|forge|neoforge|quilt|mc[\d.]+|[\d.+]+)$", "", s, flags=re.I)
-    return s.replace("-", " ").replace("_", " ").strip().title()
+    original = Path(filename).stem
+    s = re.sub(r"\[[^\]]*\]|\([^)]*\)", " ", original)
+    s = re.sub(r"\+.*$", "", s).strip(" -_.")
+    while True:
+        n = _VERSION_TAIL.sub("", s).strip(" -_.")
+        if n == s or not n:
+            break
+        s = n
+    s = s or original
+    return re.sub(r"[-_]+", " ", s).strip().title()
+
+def _clean_name(value):
+    value = str(value or "").strip()
+    return "" if "${" in value else value
+
+def _as_authors(value):
+    result = []
+    if isinstance(value, str):
+        result = [a.strip() for a in value.split(",")]
+    elif isinstance(value, list):
+        for a in value:
+            if isinstance(a, str):
+                result.append(a.strip())
+            elif isinstance(a, dict) and a.get("name"):
+                result.append(str(a["name"]).strip())
+    elif isinstance(value, dict):
+        result = [str(k).strip() for k in value]
+    return [a for a in result if a]
 
 def parse_jar(path):
     m = Mod()
     m.path = path
     m.filename = Path(path).name
-    m.sha512 = compute_sha512(path)
+    try:
+        m.size = os.path.getsize(path)
+    except OSError:
+        m.size = 0
+    m.sha512, m.sha1 = file_hashes(path)
     try:
         with zipfile.ZipFile(path) as z:
             names = z.namelist()
 
-            # Fabric
             if "fabric.mod.json" in names:
                 d = json.loads(z.read("fabric.mod.json").decode("utf-8", "replace"))
                 m.mod_id  = d.get("id", "")
-                m.name    = d.get("name", m.mod_id)
+                m.name    = _clean_name(d.get("name", "")) or m.mod_id
                 m.version = str(d.get("version", ""))
                 m.loader  = "Fabric"
                 m.desc    = d.get("description", "")
+                m.authors = _as_authors(d.get("authors"))
                 mc = d.get("depends", {}).get("minecraft", "")
                 m.mc_versions = [mc] if isinstance(mc, str) and mc else (mc if isinstance(mc, list) else [])
 
-            # NeoForge
             elif "META-INF/neoforge.mods.toml" in names:
                 m.loader = "NeoForge"
                 _parse_toml(z, "META-INF/neoforge.mods.toml", m)
 
-            # Forge
             elif "META-INF/mods.toml" in names:
                 m.loader = "Forge"
                 _parse_toml(z, "META-INF/mods.toml", m)
 
-            # Quilt
             elif "quilt.mod.json" in names:
                 d = json.loads(z.read("quilt.mod.json").decode("utf-8", "replace"))
                 ql = d.get("quilt_loader", {})
+                meta = ql.get("metadata", {})
                 m.mod_id  = ql.get("id", "")
-                m.name    = ql.get("metadata", {}).get("name", m.mod_id)
+                m.name    = _clean_name(meta.get("name", "")) or m.mod_id
                 m.version = str(ql.get("version", ""))
                 m.loader  = "Quilt"
-                m.desc    = ql.get("metadata", {}).get("description", "")
+                m.desc    = meta.get("description", "")
+                m.authors = _as_authors(meta.get("contributors"))
 
-            # Manifest fallback
             if not m.version and "META-INF/MANIFEST.MF" in names:
                 for line in z.read("META-INF/MANIFEST.MF").decode("utf-8", "replace").splitlines():
                     if line.startswith("Implementation-Version:"):
                         m.version = line.split(":", 1)[1].strip()
                         break
 
-    except (zipfile.BadZipFile, Exception):
-        pass
+    except zipfile.BadZipFile:
+        LOG.warn(f"{m.filename}: not a valid zip/jar, using filename only")
+    except Exception as e:
+        LOG.warn(f"{m.filename}: could not read metadata ({type(e).__name__}: {e}), using filename only")
 
     if not m.name:   m.name   = _stem_clean(m.filename)
     if not m.mod_id: m.mod_id = m.name.lower().replace(" ", "-")
@@ -181,16 +558,20 @@ def parse_jar(path):
 def _parse_toml(zf, fname, m):
     try:
         raw = zf.read(fname).decode("utf-8", "replace")
-        for line in raw.splitlines():
-            line = line.strip()
-            k, _, v = line.partition("=")
-            k = k.strip()
-            v = v.strip().strip('"\'')
-            if k == "modId"      and not m.mod_id:  m.mod_id  = v
-            elif k == "version"  and not m.version:  m.version = v.replace("${file.jarVersion}", "").strip()
-            elif k == "displayName" and not m.name:  m.name    = v
-    except:
-        pass
+    except (KeyError, OSError) as e:
+        LOG.warn(f"{m.filename}: cannot read {fname}: {e}")
+        return
+    for line in raw.splitlines():
+        line = line.strip()
+        if line.startswith("[[dependencies"):
+            break
+        k, _, v = line.partition("=")
+        k = k.strip()
+        v = v.strip().strip('"\'')
+        if k == "modId"         and not m.mod_id:   m.mod_id  = v
+        elif k == "version"     and not m.version:  m.version = v.replace("${file.jarVersion}", "").strip()
+        elif k == "displayName" and not m.name:     m.name    = _clean_name(v)
+        elif k == "authors"     and not m.authors:  m.authors = _as_authors(v)
 
 def scan_mods(folder):
     mods = []
@@ -203,159 +584,593 @@ def scan_mods(folder):
             mods.append(parse_jar(os.path.join(scan_path, f)))
     return mods
 
-# api modrinth
 
-class Modrinth:
+def norm(s):
+    return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
+
+def toks(s):
+    return {t for t in re.findall(r"[a-z0-9]+", (s or "").lower()) if t not in STOP_WORDS}
+
+def search_queries(mod):
+    raw = [mod.mod_id, mod.name, _stem_clean(mod.filename),
+           re.sub(r"[-_.]+", " ", mod.mod_id),
+           re.sub(r"\s*[\(\[].*?[\)\]]", "", mod.name)]
+    seen, result = set(), []
+    for q in raw:
+        q = q.strip()
+        k = norm(q)
+        if len(k) < 2 or k in seen:
+            continue
+        seen.add(k)
+        result.append(q)
+    return result[:4]
+
+def slug_refs(mod):
+    refs = []
+    for r in (mod.mod_id.lower(), mod.mod_id.lower().replace("_", "-")):
+        if re.match(r"^[\w.+\-]{3,64}$", r) and r not in refs:
+            refs.append(r)
+    return refs
+
+def score_candidate(mod, c):
+    mf = {norm(mod.mod_id), norm(mod.name), norm(_stem_clean(mod.filename))} - {""}
+    cf = {norm(c.slug), norm(c.title)} - {""}
+    if not mf or not cf:
+        return 0.0
+    if mf & cf:
+        base = 1.0
+    else:
+        fuzzy = max(SequenceMatcher(None, a, b).ratio() for a in mf for b in cf)
+        mts = [toks(mod.name), toks(_stem_clean(mod.filename)), toks(mod.mod_id)]
+        cts = [toks(c.title), toks(c.slug)]
+        jac, pair = 0.0, (set(), set())
+        for a in mts:
+            for b in cts:
+                if a and b:
+                    j = len(a & b) / len(a | b)
+                    if j > jac:
+                        jac, pair = j, (a, b)
+        base = min(0.9, 0.7 * fuzzy + 0.3 * jac)
+        if any(t.isdigit() for t in pair[0] ^ pair[1]):
+            base = min(base, 0.6)
+    if mod.authors and c.authors:
+        wanted = {norm(a) for a in mod.authors}
+        if any(norm(a) in wanted for a in c.authors):
+            base += 0.08
+    base += min(0.02, math.log10(max(c.downloads, 0) + 1) / 400)
+    return round(min(1.0, base), 3)
+
+
+class Cand:
+    def __init__(self, pid, title="", slug="", authors=None, downloads=0, raw=None):
+        self.pid = str(pid) if pid is not None else ""
+        self.title = title or ""
+        self.slug = slug or ""
+        self.authors = authors or []
+        self.downloads = downloads if isinstance(downloads, (int, float)) else 0
+        self.raw = raw or {}
+        self.score = 0.0
+        self.method = ""
+
+
+class Found:
+    def __init__(self):
+        self.provider = ""
+        self.project_id = ""
+        self.title = ""
+        self.slug = ""
+        self.version = ""
+        self.filename = ""
+        self.url = ""
+        self.hash_value = ""
+        self.hash_algo = ""
+        self.size = 0
+        self.file_id = ""
+        self.channel = "release"
+        self.site_url = ""
+        self.method = ""
+        self.score = 0.0
+        self.same_file = False
+        self.manual = False
+
+
+class Http:
     def __init__(self, sess):
         self.s = sess
 
-    def mc_versions(self):
+    def request(self, method, url, params=None, body=None, headers=None, timeout=(10, 30)):
+        t = time.monotonic()
         try:
-            r = self.s.get(f"{MODRINTH}/tag/game_version", timeout=12)
-            if r.ok:
-                return [v["version"] for v in r.json() if v.get("version_type") == "release"]
-        except:
-            pass
+            r = self.s.request(method, url, params=params, json=body, headers=headers, timeout=timeout)
+        except requests.RequestException as e:
+            ms = (time.monotonic() - t) * 1000
+            LOG.error(f"{method} {url} params={params} FAILED after {ms:.0f}ms: {type(e).__name__}: {e}")
+            return None
+        ms = (time.monotonic() - t) * 1000
+        level = "DEBUG" if (r.ok or r.status_code == 404) else "WARN"
+        LOG.log(f"{method} {r.url} -> {r.status_code} ({ms:.0f}ms, {len(r.content)}B)", level)
+        if not r.ok and r.status_code != 404:
+            LOG.warn(f"Response body: {r.text[:300]!r}")
+        remaining = r.headers.get("X-Ratelimit-Remaining", "")
+        if remaining.isdigit() and int(remaining) <= 2:
+            try:
+                wait = min(float(r.headers.get("X-Ratelimit-Reset", "5")), 15)
+            except ValueError:
+                wait = 5
+            LOG.warn(f"Rate limit nearly exhausted, sleeping {wait:.0f}s")
+            time.sleep(wait)
+        return r
+
+    def json(self, method, url, params=None, body=None, headers=None):
+        r = self.request(method, url, params=params, body=body, headers=headers)
+        if r is None or not r.ok:
+            return None
+        try:
+            return r.json()
+        except ValueError:
+            LOG.error(f"{method} {url}: invalid JSON in response")
+            return None
+
+
+class Provider:
+    name = ""
+
+    def __init__(self, http):
+        self.http = http
+        self.enabled = True
+
+    def prefetch(self, mods):
+        return 0
+
+    def hash_candidates(self, mod):
+        return []
+
+    def slug_candidates(self, mod):
+        return []
+
+    def search(self, query, ver, loader, with_version):
+        return []
+
+    def latest(self, cand, mod, ver, loader):
+        return None
+
+    def _search_all(self, mod, ver, loader, with_version):
+        pool = {}
+        for q in search_queries(mod):
+            for c in self.search(q, ver, loader, with_version):
+                if not c.pid:
+                    continue
+                c.score = score_candidate(mod, c)
+                if c.pid not in pool or c.score > pool[c.pid].score:
+                    pool[c.pid] = c
+            if pool and max(c.score for c in pool.values()) >= 0.95:
+                break
+        ranked = sorted(pool.values(), key=lambda c: -c.score)
+        mode = "with version" if with_version else "any version"
+        for c in ranked[:5]:
+            LOG.debug(f"[{self.name}] search ({mode}) candidate '{c.title}' slug={c.slug} score={c.score:.3f}")
+        return ranked
+
+    def resolve(self, mod, ver, loader):
+        info_out = {"no_build": None, "closest": None}
+        tried = set()
+        stages = [
+            ("hash",         lambda: self.hash_candidates(mod)),
+            ("slug",         lambda: self.slug_candidates(mod)),
+            ("search",       lambda: self._search_all(mod, ver, loader, True)),
+            ("search-loose", lambda: self._search_all(mod, ver, loader, False)),
+        ]
+        for method, gather in stages:
+            if not self.enabled:
+                break
+            if method == "search-loose" and info_out["no_build"]:
+                break
+            for c in gather():
+                c.method = method
+                if c.pid in tried:
+                    continue
+                if c.score < MATCH_THRESHOLD:
+                    LOG.debug(f"[{self.name}] rejected '{c.title}' ({method}) score={c.score:.3f} < {MATCH_THRESHOLD}")
+                    if not info_out["closest"] or c.score > info_out["closest"][1]:
+                        info_out["closest"] = (c.title, c.score)
+                    continue
+                tried.add(c.pid)
+                LOG.debug(f"[{self.name}] trying '{c.title}' ({method}) score={c.score:.3f}")
+                f = self.latest(c, mod, ver, loader)
+                if f:
+                    f.method = method
+                    f.score = c.score
+                    return f, info_out
+                LOG.info(f"[{self.name}] '{c.title}' matches {mod.name} but has no build for {ver}/{loader}")
+                if not info_out["no_build"]:
+                    info_out["no_build"] = c.title
+        return None, info_out
+
+
+def pick_modrinth_version(versions):
+    versions = sorted(versions, key=lambda v: v.get("date_published", ""), reverse=True)
+    for t in ("release", "beta", "alpha"):
+        for v in versions:
+            if v.get("version_type") == t:
+                return v
+    return versions[0]
+
+
+class ModrinthProvider(Provider):
+    name = "Modrinth"
+
+    @staticmethod
+    def loaders_for(loader):
+        l = loader.lower()
+        return ["quilt", "fabric"] if l == "quilt" else [l]
+
+    def mc_versions(self):
+        data = self.http.json("GET", f"{MODRINTH}/tag/game_version")
+        if isinstance(data, list):
+            vers = [v["version"] for v in data if v.get("version_type") == "release"]
+            if vers:
+                return vers
+        LOG.warn("Using built-in Minecraft version list")
         return ["1.21.4", "1.21.3", "1.21.1", "1.21", "1.20.6", "1.20.4",
                 "1.20.1", "1.20", "1.19.4", "1.19.2", "1.19", "1.18.2",
                 "1.18", "1.17.1", "1.16.5", "1.15.2", "1.14.4", "1.12.2", "1.8.9"]
 
-    def by_hash(self, sha512):
+    def prefetch(self, mods):
+        by_hash = {m.sha512: m for m in mods if m.sha512}
+        hashes = list(by_hash)
+        matched = 0
+        for i in range(0, len(hashes), 200):
+            chunk = hashes[i:i + 200]
+            data = self.http.json("POST", f"{MODRINTH}/version_files",
+                                  body={"hashes": chunk, "algorithm": "sha512"})
+            if not isinstance(data, dict):
+                continue
+            for h, v in data.items():
+                m = by_hash.get(h.lower())
+                if m and v.get("project_id"):
+                    m.hits[self.name] = {"pid": v["project_id"], "version": v.get("version_number", "")}
+                    matched += 1
+        return matched
+
+    def _project(self, ref):
+        data = self.http.json("GET", f"{MODRINTH}/project/{quote(ref, safe='')}")
+        return data if isinstance(data, dict) else None
+
+    def hash_candidates(self, mod):
+        hit = mod.hits.get(self.name)
+        if not hit:
+            return []
+        p = self._project(hit["pid"]) or {}
+        c = Cand(hit["pid"], p.get("title", ""), p.get("slug", ""), [], p.get("downloads", 0), p)
+        c.score = 1.0
+        return [c]
+
+    def slug_candidates(self, mod):
+        result = []
+        for ref in slug_refs(mod):
+            p = self._project(ref)
+            if p and p.get("project_type") == "mod":
+                c = Cand(p.get("id"), p.get("title", ""), p.get("slug", ""), [], p.get("downloads", 0), p)
+                c.score = score_candidate(mod, c)
+                result.append(c)
+        return result
+
+    def search(self, query, ver, loader, with_version):
+        facets = [["project_type:mod"], [f"categories:{l}" for l in self.loaders_for(loader)]]
+        if with_version and ver:
+            facets.append([f"versions:{ver}"])
+        data = self.http.json("GET", f"{MODRINTH}/search",
+                              params={"query": query, "limit": 10, "facets": json.dumps(facets)})
+        hits = data.get("hits", []) if isinstance(data, dict) else []
+        return [Cand(h.get("project_id"), h.get("title", ""), h.get("slug", ""),
+                     [h["author"]] if h.get("author") else [], h.get("downloads", 0), h) for h in hits]
+
+    def latest(self, cand, mod, ver, loader):
+        params = {"game_versions": json.dumps([ver]),
+                  "loaders": json.dumps(self.loaders_for(loader)),
+                  "include_changelog": "false"}
+        data = self.http.json("GET", f"{MODRINTH}/project/{cand.pid}/version", params=params)
+        if not isinstance(data, list) or not data:
+            return None
+        v = pick_modrinth_version(data)
+        files = v.get("files", [])
+        prim = (next((f for f in files if f.get("primary")), None)
+                or next((f for f in files if str(f.get("filename", "")).lower().endswith(".jar")), None)
+                or (files[0] if files else None))
+        if not prim or not prim.get("url"):
+            return None
+        hashes = prim.get("hashes", {}) or {}
+        f = Found()
+        f.provider   = self.name
+        f.project_id = cand.pid
+        f.title      = cand.title
+        f.slug       = cand.slug
+        f.version    = v.get("version_number", "")
+        f.filename   = safe_filename(prim.get("filename") or Path(prim["url"]).name)
+        f.url        = prim["url"]
+        f.hash_algo  = "sha512" if hashes.get("sha512") else ("sha1" if hashes.get("sha1") else "")
+        f.hash_value = hashes.get(f.hash_algo, "").lower() if f.hash_algo else ""
+        f.size       = prim.get("size", 0) or 0
+        f.file_id    = v.get("id", "")
+        f.channel    = v.get("version_type", "release")
+        f.site_url   = f"https://modrinth.com/mod/{cand.slug or cand.pid}"
+        f.same_file  = bool(mod.sha512) and any(
+            (x.get("hashes", {}) or {}).get("sha512", "").lower() == mod.sha512 for x in files)
+        return f
+
+
+def pick_cf_file(files):
+    files = sorted(files, key=lambda f: f.get("fileDate", ""), reverse=True)
+    for t in (1, 2, 3):
+        for f in files:
+            if f.get("releaseType") == t:
+                return f
+    return files[0]
+
+
+class CurseForgeProvider(Provider):
+    name = "CurseForge"
+
+    def __init__(self, http, key):
+        super().__init__(http)
+        self.key = key
+
+    def _headers(self):
+        return {"x-api-key": self.key, "Accept": "application/json"}
+
+    def _call(self, method, path, params=None, body=None, auth_errors=True):
+        r = self.http.request(method, CURSEFORGE + path, params=params, body=body, headers=self._headers())
+        if r is None:
+            return None
+        if auth_errors and r.status_code in (401, 403):
+            if self.enabled:
+                self.enabled = False
+                warn("CurseForge became unavailable during the run. CurseForge disabled.")
+                LOG.error(f"CurseForge returned {r.status_code}, provider disabled")
+            return None
+        if not r.ok:
+            return None
         try:
-            r = self.s.get(f"{MODRINTH}/version_file/{sha512}",
-                           params={"algorithm": "sha512"}, timeout=10)
-            return r.json() if r.ok else None
-        except:
+            return r.json()
+        except ValueError:
+            LOG.error(f"CurseForge {path}: invalid JSON in response")
             return None
 
-    def latest(self, pid, game_ver, loader):
-        try:
-            p = {"game_versions": json.dumps([game_ver])}
-            if loader:
-                p["loaders"] = json.dumps([loader.lower()])
-            r = self.s.get(f"{MODRINTH}/project/{pid}/version", params=p, timeout=10)
-            if r.ok and r.json():
-                return r.json()[0]
-        except:
-            pass
-        return None
+    def check_key(self):
+        r = self.http.request("GET", f"{CURSEFORGE}/games/{CF_GAME_ID}", headers=self._headers())
+        if r is None:
+            return "unreachable"
+        if r.ok:
+            return "ok"
+        return "invalid" if r.status_code in (401, 403) else "error"
 
-    def search(self, query, loader, game_ver):
-        try:
-            facets = [["project_type:mod"]]
-            if loader:
-                facets.append([f"categories:{loader.lower()}"])
-            if game_ver:
-                facets.append([f"versions:{game_ver}"])
-            r = self.s.get(f"{MODRINTH}/search",
-                           params={"query": query, "limit": 5, "facets": json.dumps(facets)},
-                           timeout=10)
-            hits = r.json().get("hits", []) if r.ok else []
-            return hits[0] if hits else None
-        except:
+    def prefetch(self, mods):
+        by_fp = {}
+        total = len(mods)
+        for i, m in enumerate(mods, 1):
+            try:
+                with open(m.path, "rb") as fh:
+                    m.fingerprint = cf_fingerprint(fh.read())
+            except OSError as e:
+                LOG.error(f"Fingerprint failed for {m.filename}: {e}")
+                continue
+            by_fp[m.fingerprint] = m
+            print(f"\r  Fingerprinting jars {i}/{total}", end="", flush=True)
+        print()
+        fps = list(by_fp)
+        matched = 0
+        for i in range(0, len(fps), 200):
+            chunk = fps[i:i + 200]
+            data = self._call("POST", f"/fingerprints/{CF_GAME_ID}", body={"fingerprints": chunk})
+            if not isinstance(data, dict):
+                continue
+            for hit in (data.get("data", {}) or {}).get("exactMatches", []) or []:
+                f = hit.get("file", {}) or {}
+                m = by_fp.get(f.get("fileFingerprint"))
+                if m and hit.get("id"):
+                    m.hits[self.name] = {"pid": hit["id"], "file_id": f.get("id")}
+                    matched += 1
+        return matched
+
+    def _cands(self, items):
+        result = []
+        for d in items or []:
+            if d.get("classId") not in (None, CF_CLASS_MODS):
+                continue
+            authors = [a.get("name", "") for a in (d.get("authors") or []) if isinstance(a, dict)]
+            result.append(Cand(d.get("id"), d.get("name", ""), d.get("slug", ""),
+                               authors, d.get("downloadCount", 0), d))
+        return result
+
+    def hash_candidates(self, mod):
+        hit = mod.hits.get(self.name)
+        if not hit:
+            return []
+        data = self._call("GET", f"/mods/{hit['pid']}")
+        d = (data or {}).get("data") or {}
+        cands = self._cands([d]) if d else [Cand(hit["pid"])]
+        for c in cands:
+            c.score = 1.0
+        return cands
+
+    def slug_candidates(self, mod):
+        result = []
+        for ref in slug_refs(mod):
+            data = self._call("GET", "/mods/search",
+                              params={"gameId": CF_GAME_ID, "classId": CF_CLASS_MODS, "slug": ref})
+            for c in self._cands((data or {}).get("data")):
+                c.score = score_candidate(mod, c)
+                result.append(c)
+        return result
+
+    def search(self, query, ver, loader, with_version):
+        params = {"gameId": CF_GAME_ID, "classId": CF_CLASS_MODS, "searchFilter": query,
+                  "sortField": 2, "sortOrder": "desc", "pageSize": 20}
+        if with_version and ver:
+            params["gameVersion"] = ver
+            if loader.lower() != "quilt":
+                params["modLoaderType"] = CF_LOADER_IDS[loader.lower()]
+        data = self._call("GET", "/mods/search", params=params)
+        return self._cands((data or {}).get("data"))
+
+    def _compatible(self, files, ver, ld):
+        result = []
+        known_tags = set(CF_LOADER_TAG.values())
+        for f in files or []:
+            if f.get("isAvailable") is False:
+                continue
+            gv = f.get("gameVersions", []) or []
+            if ver not in gv:
+                continue
+            tags = known_tags & set(gv)
+            if tags and CF_LOADER_TAG[ld] not in tags:
+                continue
+            result.append(f)
+        return result
+
+    def latest(self, cand, mod, ver, loader):
+        l = loader.lower()
+        chosen, used_loader = None, l
+        for ld in ([l, "fabric"] if l == "quilt" else [l]):
+            data = self._call("GET", f"/mods/{cand.pid}/files",
+                              params={"gameVersion": ver, "modLoaderType": CF_LOADER_IDS[ld], "pageSize": 50})
+            files = self._compatible((data or {}).get("data"), ver, ld)
+            if files:
+                chosen, used_loader = pick_cf_file(files), ld
+                break
+        if not chosen:
             return None
+        fid = chosen.get("id")
+        url = chosen.get("downloadUrl") or ""
+        if not url:
+            data = self._call("GET", f"/mods/{cand.pid}/files/{fid}/download-url", auth_errors=False)
+            url = (data or {}).get("data") or ""
+        sha1 = next((h.get("value", "") for h in chosen.get("hashes", []) if h.get("algo") == 1), "")
+        links = cand.raw.get("links", {}) if cand.raw else {}
+        site = links.get("websiteUrl", "") if isinstance(links, dict) else ""
+        f = Found()
+        f.provider   = self.name
+        f.project_id = cand.pid
+        f.title      = cand.title
+        f.slug       = cand.slug
+        f.version    = chosen.get("displayName") or chosen.get("fileName", "")
+        f.filename   = safe_filename(chosen.get("fileName") or f"{cand.slug or cand.pid}-{fid}.jar")
+        f.url        = url
+        f.hash_algo  = "sha1" if sha1 else ""
+        f.hash_value = sha1.lower()
+        f.size       = chosen.get("fileLength", 0) or 0
+        f.file_id    = str(fid)
+        f.channel    = {1: "release", 2: "beta", 3: "alpha"}.get(chosen.get("releaseType"), "release")
+        f.site_url   = f"{site}/files/{fid}" if site else f"https://www.curseforge.com/minecraft/mc-mods/{cand.slug}"
+        f.manual     = not url
+        hit = mod.hits.get(self.name) or {}
+        f.same_file  = (str(hit.get("file_id", "")) == str(fid)
+                        or (bool(mod.sha1) and mod.sha1 == f.hash_value)
+                        or (not f.hash_value and f.filename == mod.filename))
+        if used_loader != l:
+            LOG.info(f"[CurseForge] no {loader} file for {cand.title}, using {used_loader} file (Quilt compatibility)")
+        return f
 
-    def resolve(self, mod, game_ver, loader):
-        pid = None
 
-        fv = self.by_hash(mod.sha512)
-        if fv:
-            pid = fv.get("project_id", "")
+class DownloadError(Exception):
+    def __init__(self, msg, retryable=True, permanent=False):
+        super().__init__(msg)
+        self.retryable = retryable
+        self.permanent = permanent
 
-        if not pid and mod.project_id:
-            pid = mod.project_id
 
-        if not pid:
-            h = self.search(mod.mod_id, loader, game_ver)
-            if h:
-                pid = h.get("project_id", "")
+def describe_error(e):
+    if isinstance(e, requests.exceptions.Timeout):
+        return "Timed out"
+    if isinstance(e, requests.exceptions.ChunkedEncodingError):
+        return "Connection dropped mid-download"
+    if isinstance(e, requests.exceptions.SSLError):
+        return "SSL error"
+    if isinstance(e, requests.exceptions.RetryError):
+        return "Server kept returning errors"
+    if isinstance(e, requests.exceptions.ConnectionError):
+        return "Connection error"
+    return type(e).__name__
 
-        if not pid and mod.name != mod.mod_id:
-            h = self.search(mod.name, loader, game_ver)
-            if h:
-                pid = h.get("project_id", "")
+def show_progress(done, total):
+    if total:
+        pct = min(100.0, done / total * 100)
+        width = max(10, min(40, LIVE.width() - 38))
+        filled = int(pct / 100 * width)
+        line = f"     [{'#' * filled}{'-' * (width - filled)}] {pct:5.1f}%  {fmt_size(done)}/{fmt_size(total)}"
+    else:
+        line = f"     {fmt_size(done)} downloaded"
+    LIVE.set_progress(line)
 
-        if not pid:
-            return None
-
-        mod.project_id = pid
-        return self.latest(pid, game_ver, loader)
-
-# DOWNLOAD
-
-def download_file(sess, url, dest):
+def download_file(sess, url, dest, expected_hash="", algo="", expected_size=0):
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    part = dest + ".part"
+    hasher = hashlib.new(algo) if algo in ("sha512", "sha1", "md5") else None
+    done = 0
     try:
-        os.makedirs(os.path.dirname(dest), exist_ok=True)
-        r = sess.get(url, stream=True, timeout=90)
-        r.raise_for_status()
-        total = int(r.headers.get("content-length", 0))
-        done  = 0
-        with open(dest, "wb") as f:
-            for chunk in r.iter_content(65536):
-                if chunk:
-                    f.write(chunk)
-                    done += len(chunk)
-                    if total:
-                        pct = done / total * 100
-                        filled = int(pct / 2)
-                        bar = "#" * filled + "-" * (50 - filled)
-                        print(f"\r     [{bar}] {pct:5.1f}%  {fmt_size(done)}/{fmt_size(total)}", end="", flush=True)
-        print()
-        return True
-    except Exception as e:
-        print()
-        return str(e)
-
-# -
-
-class Logger:
-    def __init__(self):
-        self._lines = []
-        self._path  = None
-
-    def log(self, msg, level="INFO"):
-        ts   = datetime.now().strftime("%H:%M:%S")
-        line = f"[{ts}][{level}] {msg}"
-        self._lines.append(line)
-
-    def set_path(self, path):
-        self._path = path
-
-    def save(self):
-        if not self._path:
-            return
         try:
-            with open(self._path, "w", encoding="utf-8") as f:
-                f.write(f"MC Mod Manager v{APP_VER}\n")
-                f.write(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-                f.write("=" * 60 + "\n")
-                f.write("\n".join(self._lines))
-        except:
-            pass
-
-# main
+            r = sess.get(url, stream=True, timeout=(10, 60))
+        except requests.RequestException as e:
+            LOG.debug(f"Download request error for {url}: {e!r}")
+            raise DownloadError(describe_error(e))
+        with r:
+            if r.status_code >= 400:
+                raise DownloadError(f"HTTP {r.status_code} {r.reason or ''}".strip(),
+                                    retryable=r.status_code in (408, 425, 429) or r.status_code >= 500)
+            total = expected_size or int(r.headers.get("content-length") or 0)
+            try:
+                with open(part, "wb") as fh:
+                    for chunk in r.iter_content(65536):
+                        if not chunk:
+                            continue
+                        fh.write(chunk)
+                        done += len(chunk)
+                        if hasher:
+                            hasher.update(chunk)
+                        show_progress(done, total)
+            except requests.RequestException as e:
+                LOG.debug(f"Download stream error for {url} after {done} bytes: {e!r}")
+                raise DownloadError(f"{describe_error(e)} after {fmt_size(done)}")
+            except OSError as e:
+                raise DownloadError(f"Disk error: {e}", retryable=False)
+        if expected_size and done != expected_size:
+            raise DownloadError(f"Size mismatch: got {done} bytes, expected {expected_size}")
+        if hasher and expected_hash and hasher.hexdigest().lower() != expected_hash.lower():
+            raise DownloadError(f"Hash mismatch ({algo}), file is corrupted or incomplete")
+        os.replace(part, dest)
+        return done
+    finally:
+        LIVE.set_progress(None)
+        if os.path.exists(part):
+            try:
+                os.remove(part)
+            except OSError:
+                pass
 
 
 class App:
     def __init__(self):
-        self.folder = ""
-        self.ver    = ""
-        self.loader = ""
-        self.mods   = []
-        self.sess   = make_session()
-        self.mr     = Modrinth(self.sess)
-        self.log    = Logger()
+        self.folder    = ""
+        self.ver       = ""
+        self.loader    = ""
+        self.mods      = []
+        self.sess      = make_session()
+        self.http      = Http(self.sess)
+        self.mr        = ModrinthProvider(self.http)
+        self.providers = [self.mr]
+        self.t_start   = time.monotonic()
+        LOG.info(f"Session started, app v{APP_VER}")
 
-    # entry point
     def run(self):
         clr()
         banner("Minecraft Mod Manager")
         print()
-        print("  This tool scans your mods folder, checks Modrinth for the")
-        print("  latest versions, and downloads them into a clean output folder.")
+        print("  This tool scans your mods folder, checks Modrinth and CurseForge")
+        print("  for the latest versions, and downloads them into a clean output folder.")
         print()
         sep()
 
+        self._setup_sources()
         self._step_folder()
         self._step_version()
         self._step_loader()
@@ -363,7 +1178,57 @@ class App:
         self._step_confirm()
         self._step_download()
 
-    # select folder ( step 1 xd ) 
+    def _setup_sources(self):
+        print()
+        info("Checking CurseForge...")
+        key, origin = get_curseforge_key()
+        LOG.info(f"CurseForge key source: {origin}")
+
+        if not key:
+            result, reason = "missing", "No CurseForge key is available in this build."
+        else:
+            cf = CurseForgeProvider(self.http, key)
+            result = cf.check_key()
+            reason = {
+                "invalid":     "CurseForge rejected the API key (HTTP 401/403).",
+                "unreachable": "Could not reach api.curseforge.com (network error or timeout).",
+                "error":       "CurseForge returned an unexpected error (see HTTP lines above).",
+            }.get(result, "")
+
+        if result == "ok":
+            LOG.info("CurseForge enabled")
+            self.providers.append(cf)
+            ok("CurseForge Enabled")
+            time.sleep(1)
+            return
+
+        LOG.error(f"CurseForge disabled: {reason}")
+        log_path = self._startup_log_path()
+        print()
+        info("CurseForge Disabled:")
+        out("  Full log located at:")
+        out(f"  {log_path}")
+        print()
+        try:
+            input("  Press Enter to skip for now...")
+        except (KeyboardInterrupt, EOFError):
+            print()
+            sys.exit(0)
+
+    def _startup_log_path(self):
+        """Creates a log file right away and returns its path (or a note if it can't be written)."""
+        import tempfile
+        name = f"curseforge_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        for base in (Path.home() / ".mc_mod_manager_logs", Path(tempfile.gettempdir()) / "mc_mod_manager_logs"):
+            try:
+                base.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                continue
+            path = str(base / name)
+            if LOG.set_path(path):
+                return path
+        return "(could not create a log file)"
+
     def _step_folder(self):
         clr()
         banner("Step 1 of 4 -- Select Minecraft Folder")
@@ -399,9 +1264,9 @@ class App:
             else:
                 warn("Please enter 1 or 2.")
 
+        LOG.context["Minecraft folder"] = self.folder
         pause()
 
-    # check mc versions and ask to select one ( want to update to ) ( step 2 )
     def _step_version(self):
         clr()
         banner("Step 2 of 4 -- Select Target Minecraft Version")
@@ -410,7 +1275,6 @@ class App:
         ver_list = self.mr.mc_versions()
         print()
 
-        # Show top 20 common versions
         top = ver_list[:20]
         for i, v in enumerate(top, 1):
             print(f"  [{i:>2}]  {v}")
@@ -420,7 +1284,6 @@ class App:
 
         while True:
             ch = prompt("Enter number or version string:")
-            # Try as list index
             try:
                 idx = int(ch) - 1
                 if 0 <= idx < len(top):
@@ -429,16 +1292,15 @@ class App:
                     break
             except ValueError:
                 pass
-            # Try as version string
             if re.match(r"^\d+\.\d+", ch):
                 self.ver = ch
                 ok(f"Target version: {self.ver}")
                 break
             warn("Invalid input. Enter a number from the list or a version like 1.21.4")
 
+        LOG.context["Target version"] = self.ver
         pause()
 
-    # loader ( fabric forge and etc )
     def _step_loader(self):
         clr()
         banner("Step 3 of 4 -- Select Mod Loader")
@@ -459,9 +1321,10 @@ class App:
                 pass
             warn("Please enter a number between 1 and 4.")
 
+        LOG.context["Loader"] = self.loader
+        LOG.context["Sources"] = ", ".join(p.name for p in self.providers)
         pause()
 
-    # scan but in step 4 ( mod scan not etc )
     def _step_scan(self):
         clr()
         banner("Step 4 of 4 -- Scanning Mods Folder")
@@ -469,86 +1332,142 @@ class App:
         info(f"Scanning: {self.folder}")
         print()
 
+        t_scan = time.monotonic()
+        LOG.section("SCAN")
         self.mods = scan_mods(self.folder)
 
         if not self.mods:
             warn("No .jar files found in the mods folder.")
             warn("Make sure the folder contains a 'mods' subdirectory with .jar files.")
+            LOG.warn(f"No .jar files found in {self.folder}")
             pause()
             sys.exit(0)
 
         ok(f"Found {len(self.mods)} mod(s).")
-        self.log.log(f"Scanned: {len(self.mods)} mods")
+        LOG.info(f"Scanned {len(self.mods)} jar(s) in {self.folder}")
+        for m in self.mods:
+            LOG.info(f"JAR {m.filename} | {fmt_size(m.size)} | loader={m.loader or '?'} | id={m.mod_id} | "
+                     f"name={m.name} | version={m.version or '?'} | authors={', '.join(m.authors) or '?'} | "
+                     f"sha512={m.sha512[:16]}...")
         print()
 
-        # Check for updates
-        info(f"Checking Modrinth for {self.ver} / {self.loader} versions...")
+        LOG.section("EXACT FILE LOOKUP")
+        for p in self.providers:
+            info(f"Looking up exact file matches on {p.name}...")
+            n = p.prefetch(self.mods)
+            ok(f"{p.name}: {n}/{len(self.mods)} jar(s) recognized by file hash.")
+            LOG.info(f"{p.name} exact matches: {n}/{len(self.mods)}")
         print()
 
-        total  = len(self.mods)
-        avail  = 0
-        uptodt = 0
-        notfnd = 0
+        info(f"Checking for {self.ver} / {self.loader} versions...")
+        print()
+        LOG.section(f"RESOLVE ({self.ver} / {self.loader})")
+
+        total = len(self.mods)
+        counts = {"available": 0, "up_to_date": 0, "no_build": 0, "not_found": 0}
+        via = {}
 
         for i, m in enumerate(self.mods, 1):
             label = f"[{i}/{total}] {m.name or m.filename}"
-            print(f"  {label:<50}", end="", flush=True)
-
-            ver_data = self.mr.resolve(m, self.ver, self.loader)
-            if ver_data:
-                files = ver_data.get("files", [])
-                prim  = next((f for f in files if f.get("primary")), files[0] if files else None)
-                m.new_version = ver_data.get("version_number", "")
-                m.new_url     = prim["url"] if prim else ""
-                if m.new_version == m.version:
-                    m.status = "up_to_date"
-                    uptodt += 1
-                    print(f"  up-to-date ({m.version})")
-                else:
-                    m.status = "available"
-                    avail += 1
-                    print(f"  update available -> {m.new_version}")
-            else:
-                m.status = "not_found"
-                notfnd += 1
-                print("  not found on Modrinth")
-
-            self.log.log(f"Check [{m.status}] {m.name} -> {m.new_version or 'N/A'}")
+            print(f"  {label[:46]:<46}", end="", flush=True)
+            self._resolve(m)
+            counts[m.status] += 1
+            if m.found:
+                via[m.found.provider] = via.get(m.found.provider, 0) + 1
+            print(self._status_text(m))
 
         sep()
         print()
-        ok(f"Results: {avail} update(s) available, {uptodt} up-to-date, {notfnd} not found.")
+        ok(f"Results: {counts['available']} update(s) available, {counts['up_to_date']} up-to-date, "
+           f"{counts['no_build']} no build for {self.ver}, {counts['not_found']} not found.")
+        if via:
+            info("Found via: " + ", ".join(f"{k} {v}" for k, v in via.items()))
+        LOG.info(f"Resolve summary: {counts} via={via} in {time.monotonic() - t_scan:.1f}s")
         print()
         pause()
 
-    # confirm by user to continue ( update and download )
+    def _resolve(self, m):
+        started = time.monotonic()
+        no_build = None
+        closest = None
+        for p in self.providers:
+            if not p.enabled:
+                continue
+            found, inf = p.resolve(m, self.ver, self.loader)
+            if found:
+                m.found = found
+                same = found.same_file or bool(m.version and found.version == m.version)
+                m.status = "up_to_date" if same else "available"
+                break
+            if inf["no_build"] and not no_build:
+                no_build = (p.name, inf["no_build"])
+            if inf["closest"] and (not closest or inf["closest"][1] > closest[2]):
+                closest = (p.name, inf["closest"][0], inf["closest"][1])
+        else:
+            if no_build:
+                m.status = "no_build"
+                m.no_build = no_build
+            else:
+                m.status = "not_found"
+                m.closest = closest
+
+        took = time.monotonic() - started
+        f = m.found
+        if f:
+            LOG.info(f"RESOLVED [{m.status}] {m.name} ({m.filename}) -> {f.provider} '{f.title}' via {f.method} "
+                     f"(score {f.score:.2f}) | {f.version} | {f.channel} | file={f.filename} | "
+                     f"same_file={f.same_file} | manual={f.manual} | {took:.1f}s")
+        elif m.status == "no_build":
+            LOG.warn(f"RESOLVED [no_build] {m.name}: found '{m.no_build[1]}' on {m.no_build[0]} "
+                     f"but no build for {self.ver}/{self.loader} | {took:.1f}s")
+        else:
+            extra = f" closest='{m.closest[1]}' on {m.closest[0]} score={m.closest[2]:.2f}" if m.closest else ""
+            LOG.warn(f"RESOLVED [not_found] {m.name} ({m.filename}){extra} | {took:.1f}s")
+
+    def _status_text(self, m):
+        f = m.found
+        if m.status == "up_to_date":
+            return f"  up-to-date ({m.version or f.version}) [{f.provider}]"
+        if m.status == "available":
+            extra = "" if f.channel == "release" else f" ({f.channel})"
+            manual = " manual download only" if f.manual else ""
+            return f"  update available -> {f.version}{extra} [{f.provider}]{manual}"
+        if m.status == "no_build":
+            return f"  no build for {self.ver}/{self.loader} (found: {m.no_build[1]})"
+        hint = f" (closest: {m.closest[1]}, {m.closest[2]:.2f})" if m.closest and m.closest[2] >= 0.45 else ""
+        return f"  not found{hint}"
+
     def _step_confirm(self):
         clr()
         banner("Confirm Download")
         print()
 
-        # Print summary table
-        col_n = 35
-        col_v = 20
-        col_s = 14
-        header = f"  {'Mod':<{col_n}} {'Current':<{col_v}} {'Status':<{col_s}} New Version"
+        col_n = 30
+        col_v = 18
+        col_s = 12
+        col_p = 11
+        header = f"  {'Mod':<{col_n}} {'Current':<{col_v}} {'Status':<{col_s}} {'Source':<{col_p}} New Version"
         print(header)
         sep("-", len(header) + 14)
 
         downloadable = 0
         for m in self.mods:
-            name   = (m.name or m.filename)[:col_n - 1]
-            cur    = (m.version or "?")[:col_v - 1]
+            name = (m.name or m.filename)[:col_n - 1]
+            cur  = (m.version or "?")[:col_v - 1]
+            f = m.found
             if m.status == "available":
                 status = "UPDATE"
                 downloadable += 1
             elif m.status == "up_to_date":
                 status = "up-to-date"
                 downloadable += 1
+            elif m.status == "no_build":
+                status = "no build"
             else:
                 status = "not found"
-            new_v = m.new_version or ""
-            print(f"  {name:<{col_n}} {cur:<{col_v}} {status:<{col_s}} {new_v}")
+            source = f.provider if f else ""
+            new_v = f.version if f else ""
+            print(f"  {name:<{col_n}} {cur:<{col_v}} {status:<{col_s}} {source:<{col_p}} {new_v}")
 
         sep()
         print()
@@ -562,9 +1481,18 @@ class App:
         if ch.lower() not in ("y", "yes"):
             print()
             warn("Aborted.")
+            LOG.info("User aborted at confirmation")
             sys.exit(0)
 
-    # download all
+    def _unique_name(self, name, used):
+        base, ext = os.path.splitext(name)
+        cand, n = name, 2
+        while cand.lower() in used:
+            cand = f"{base}_{n}{ext}"
+            n += 1
+        used.add(cand.lower())
+        return cand
+
     def _step_download(self):
         clr()
         banner("Downloading Mods")
@@ -575,70 +1503,249 @@ class App:
         os.makedirs(mods_out, exist_ok=True)
 
         log_path = os.path.join(out_folder, f"log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
-        self.log.set_path(log_path)
-        self.log.log(f"Output: {out_folder}")
+        LOG.set_path(log_path)
+        LOG.section("DOWNLOAD")
+        LOG.info(f"Output: {out_folder}")
 
         ok(f"Output folder created: {out_folder}")
         print()
         sep()
 
-        total   = len(self.mods)
-        success = 0
-        skipped = 0
+        LIVE.reset()
+        LIVE.start()
+        used = set()
+        total = len(self.mods)
 
-        for i, m in enumerate(self.mods, 1):
-            name = m.name or m.filename
-            print()
-            print(f"  [{i}/{total}] {name}")
+        try:
+            for i, m in enumerate(self.mods, 1):
+                out()
+                out(f"  [{i}/{total}] {m.name or m.filename}")
+                self._process(m, mods_out, used)
+            self._retry_rounds()
+        finally:
+            elapsed = LIVE.elapsed()
 
-            if m.status == "not_found" or not m.new_url:
-                if m.status == "up_to_date" and not m.new_url:
-                    # Copy existing file unchanged
-                    if os.path.isfile(m.path):
-                        shutil.copy2(m.path, os.path.join(mods_out, m.filename))
-                        info(f"Copied (already up-to-date): {m.filename}")
-                        success += 1
-                        self.log.log(f"Copied: {m.filename}")
-                    continue
-                warn(f"Skipping: not found on Modrinth for {self.ver} / {self.loader}")
-                skipped += 1
-                self.log.log(f"Skipped: {name}", "WARN")
-                continue
-
-            if m.status == "up_to_date":
-                # Download the confirmed-same version to keep the output folder self-contained
-                info(f"Already up-to-date ({m.version}), downloading to output folder...")
-            else:
-                info(f"Downloading version {m.new_version}...")
-
-            self.log.log(f"Downloading: {name} -> {m.new_version}")
-            fname  = m.new_url.split("/")[-1].split("?")[0]
-            dest   = os.path.join(mods_out, fname)
-            result = download_file(self.sess, m.new_url, dest)
-
-            if result is True:
-                ok(f"Done: {fname}")
-                success += 1
-                self.log.log(f"OK: {name} v{m.new_version}")
-            else:
-                err(f"Failed: {result}")
-                self.log.log(f"Error: {name}: {result}", "ERROR")
-
-        print()
+        counts = self._write_summary(elapsed)
+        out()
         sep()
-        print()
-        ok(f"Finished: {success}/{total} mods downloaded successfully. {skipped} skipped.")
+        out()
+        ready = counts["downloaded"] + counts["copied"] + counts["present"]
+        line = (f"Finished: {ready}/{total} mods ready ({counts['downloaded']} downloaded, "
+                f"{counts['copied']} copied, {counts['present']} already present). "
+                f"{counts['skipped']} skipped, {counts['failed']} failed.")
+        (warn if counts["failed"] else ok)(line)
         ok(f"Output folder: {out_folder}")
-        self.log.save()
         ok(f"Log saved: {log_path}")
-        print()
+        LOG.close()
+        LIVE.stop()
         pause()
 
+    def _process(self, m, mods_out, used):
+        t0 = time.monotonic()
+        name = m.name or m.filename
+        f = m.found
 
-# entry ( last )
-if __name__ == "__main__":
+        if m.status in ("not_found", "no_build") or not f:
+            if m.status == "no_build":
+                reason = f"found '{m.no_build[1]}' on {m.no_build[0]} but no build for {self.ver} / {self.loader}"
+            else:
+                reason = f"not found on {' / '.join(p.name for p in self.providers)} for {self.ver} / {self.loader}"
+            warn(f"Skipping: {reason}")
+            LOG.warn(f"SKIPPED {name}: {reason}")
+            m.dl = "skipped"
+            return
+
+        if m.status == "up_to_date" and f.same_file and os.path.isfile(m.path):
+            dest = os.path.join(mods_out, self._unique_name(m.filename, used))
+            try:
+                shutil.copy2(m.path, dest)
+            except OSError as e:
+                m.dl, m.error, m.retryable = "failed", f"Copy failed: {e}", True
+                m.dest = dest
+                err(m.error)
+                LOG.error(f"FAILED {name}: {m.error}")
+                return
+            m.dl, m.dest = "copied", dest
+            info(f"Copied (already up-to-date, identical file): {m.filename}")
+            LOG.info(f"COPIED {name}: {m.filename} (identical to {f.provider} file {f.version})")
+            return
+
+        m.dest = os.path.join(mods_out, self._unique_name(f.filename, used))
+
+        if f.manual or not f.url:
+            m.dl, m.retryable = "failed", False
+            m.error = f"Download disabled by the author, get it manually: {f.site_url}"
+            err(m.error)
+            LOG.error(f"FAILED {name}: {m.error}")
+            return
+
+        if f.hash_algo and os.path.isfile(m.dest) and hash_file(m.dest, f.hash_algo) == f.hash_value:
+            m.dl = "present"
+            info(f"Already present and verified: {os.path.basename(m.dest)}")
+            LOG.info(f"PRESENT {name}: {os.path.basename(m.dest)} verified ({f.hash_algo})")
+            return
+
+        if m.status == "up_to_date":
+            info(f"Already up-to-date ({m.version}), downloading to output folder...")
+        self._download(m)
+        m.elapsed += time.monotonic() - t0
+
+    def _download(self, m):
+        f = m.found
+        name = m.name or m.filename
+        fname = os.path.basename(m.dest)
+        m.error = ""
+        for attempt in range(1, DL_ATTEMPTS + 1):
+            m.attempts += 1
+            suffix = f" (attempt {attempt}/{DL_ATTEMPTS})" if attempt > 1 else ""
+            info(f"Downloading {f.version} from {f.provider}{suffix}...")
+            LOG.info(f"DOWNLOAD {name} -> {f.version} | {f.provider} | attempt {attempt}/{DL_ATTEMPTS} | {f.url}")
+            t = time.monotonic()
+            try:
+                size = download_file(self.sess, f.url, m.dest, f.hash_value, f.hash_algo, f.size)
+            except DownloadError as e:
+                took = time.monotonic() - t
+                m.error = str(e)
+                LOG.error(f"DOWNLOAD FAILED {name}: {e} | attempt {attempt}/{DL_ATTEMPTS} | {took:.1f}s | {f.url}")
+                if e.retryable and attempt < DL_ATTEMPTS:
+                    delay = 2 * attempt
+                    warn(f"Failed: {e}. Retrying in {delay}s...")
+                    LOG.warn(f"Auto-retry {name} in {delay}s")
+                    time.sleep(delay)
+                    continue
+                m.dl = "failed"
+                m.retryable = not e.permanent
+                err(f"Failed: {e}")
+                return False
+            took = time.monotonic() - t
+            m.dl, m.error = "downloaded", ""
+            verified = f"{f.hash_algo} verified" if f.hash_algo and f.hash_value else "not verified"
+            ok(f"Done: {fname} ({fmt_size(size)}, {fmt_took(took)})")
+            LOG.info(f"DOWNLOADED {name}: {fname} | {fmt_size(size)} | {took:.1f}s | {verified} | attempts={attempt}")
+            return True
+        return False
+
+    def _refresh_source(self, m):
+        f = m.found
+        provider = next((p for p in self.providers if p.name == f.provider and p.enabled), None)
+        if not provider:
+            return
+        cand = Cand(f.project_id, f.title, f.slug)
+        fresh = provider.latest(cand, m, self.ver, self.loader)
+        if fresh and not fresh.manual and fresh.url:
+            fresh.method, fresh.score = f.method, f.score
+            if fresh.url != f.url or fresh.file_id != f.file_id:
+                LOG.info(f"Refreshed source for {m.name}: {f.version} -> {fresh.version}")
+            m.found = fresh
+        else:
+            LOG.warn(f"Could not refresh source for {m.name}, using the previous link")
+
+    def _retry_rounds(self):
+        rnd = 0
+        while True:
+            failed = [m for m in self.mods if m.dl == "failed"]
+            if not failed:
+                return
+            retryable = [m for m in failed if m.retryable]
+
+            out()
+            sep()
+            warn(f"{len(failed)} mod(s) failed to download:")
+            LOG.warn(f"{len(failed)} mod(s) failed to download")
+            for m in failed:
+                f = m.found
+                note = "" if m.retryable else "  [cannot retry]"
+                out(f"   • {m.name or m.filename} [{f.provider if f else '?'}] {m.error}{note}")
+                LOG.warn(f"FAILED {m.name} [{f.provider if f else '?'}]: {m.error} | retryable={m.retryable} | attempts={m.attempts}")
+            if not retryable:
+                return
+
+            LIVE.stop()
+            ch = prompt(f"Retry {len(retryable)} failed mod(s)? [y/n]:")
+            if ch.lower() not in ("y", "yes"):
+                LOG.info("User declined to retry failed downloads")
+                LIVE.start()
+                return
+            LIVE.start()
+
+            rnd += 1
+            LOG.section(f"RETRY ROUND {rnd}")
+            LOG.info(f"Retrying {len(retryable)} mod(s): " + ", ".join(m.name or m.filename for m in retryable))
+            out()
+            info(f"Retry round {rnd}: {len(retryable)} mod(s)")
+            for i, m in enumerate(retryable, 1):
+                out()
+                out(f"  [{i}/{len(retryable)}] {m.name or m.filename}")
+                m.retry_rounds += 1
+                t0 = time.monotonic()
+                self._refresh_source(m)
+                if m.found.manual or not m.found.url:
+                    m.error = f"Download disabled by the author, get it manually: {m.found.site_url}"
+                    m.retryable = False
+                    err(m.error)
+                    LOG.error(f"RETRY FAILED {m.name}: {m.error}")
+                    continue
+                success = self._download(m)
+                m.elapsed += time.monotonic() - t0
+                if success:
+                    LOG.info(f"RECOVERED {m.name} in retry round {rnd}")
+                else:
+                    LOG.error(f"RETRY FAILED {m.name} in round {rnd}: {m.error}")
+
+    def _write_summary(self, elapsed):
+        counts = {"downloaded": 0, "copied": 0, "present": 0, "skipped": 0, "failed": 0}
+        for m in self.mods:
+            key = m.dl if m.dl in counts else None
+            if key:
+                counts[key] += 1
+        recovered = [m for m in self.mods if m.dl in ("downloaded", "present") and m.retry_rounds]
+        failed = [m for m in self.mods if m.dl == "failed"]
+
+        LOG.section("SUMMARY")
+        LOG.info(f"Target: Minecraft {self.ver} / {self.loader} | sources: {', '.join(p.name for p in self.providers)}")
+        LOG.info(f"Mods: {len(self.mods)} | downloaded={counts['downloaded']} copied={counts['copied']} "
+                 f"already_present={counts['present']} skipped={counts['skipped']} failed={counts['failed']} "
+                 f"recovered_by_retry={len(recovered)}")
+        LOG.info(f"Download time: {fmt_dur(elapsed)} | total session time: {fmt_dur(time.monotonic() - self.t_start)}")
+        LOG.info(f"Log entries: {LOG.counts}")
+        for m in self.mods:
+            f = m.found
+            LOG.info(f"RESULT [{m.dl:<10}] {m.name} | {f.provider + ' ' + f.version if f else '-'} | "
+                     f"attempts={m.attempts} retry_rounds={m.retry_rounds} | {fmt_took(m.elapsed)}"
+                     + (f" | error={m.error}" if m.dl == "failed" else ""))
+        if recovered:
+            LOG.info("RECOVERED BY RETRY: " + ", ".join(m.name or m.filename for m in recovered))
+        if failed:
+            LOG.error(f"STILL FAILED ({len(failed)}):")
+            for m in failed:
+                f = m.found
+                LOG.error(f"  {m.name} | {m.filename} | {f.provider if f else '?'} | {m.error} | "
+                          f"{f.url if f and f.url else (f.site_url if f else '')}")
+        return counts
+
+
+def main():
     try:
         App().run()
     except KeyboardInterrupt:
+        LIVE.stop()
+        LOG.warn("Interrupted by user (Ctrl+C)")
         print("\n\n  Interrupted.\n")
+        LOG.close()
         sys.exit(0)
+    except SystemExit:
+        LOG.close()
+        raise
+    except Exception as e:
+        LIVE.stop()
+        LOG.error(f"Unhandled exception: {type(e).__name__}: {e}\n{traceback.format_exc()}")
+        err(f"Unexpected error: {type(e).__name__}: {e}")
+        if LOG.path:
+            err(f"Details saved in: {LOG.path}")
+        LOG.close()
+        sys.exit(1)
+    LOG.close()
+
+
+if __name__ == "__main__":
+    main()
