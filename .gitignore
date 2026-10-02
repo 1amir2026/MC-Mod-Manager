@@ -4,4 +4,5 @@ dist/
 __pycache__/
 *.spec
 *.pyc
-"@ | Out-File -Encoding utf8 .gitignore
+_cf_secret.py
+"@ | Out-File -Encoding ascii .gitignore
