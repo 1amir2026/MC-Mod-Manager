@@ -30,13 +30,18 @@ jobs:
       - name: Install dependencies
         run: pip install pyinstaller requests packaging
 
+      - name: Embed CurseForge key (from secret)
+        run: python make_secret.py
+        env:
+          CF_API_KEY: ${{ secrets.CF_API_KEY }}
+
       - name: Build (Windows)
         if: runner.os == 'Windows'
-        run: pyinstaller --onefile --console --name "${{ matrix.output }}" --icon=icon1.ico mc_mod_manager_cli.py
+        run: pyinstaller --onefile --console --name "${{ matrix.output }}" --icon=Icon1.ico --hidden-import _cf_secret mc_mod_manager_cli.py
 
       - name: Build (Linux / macOS)
         if: runner.os != 'Windows'
-        run: pyinstaller --onefile --console --name "${{ matrix.output }}" mc_mod_manager_cli.py
+        run: pyinstaller --onefile --console --name "${{ matrix.output }}" --hidden-import _cf_secret mc_mod_manager_cli.py
 
       - name: Upload to Release
         uses: softprops/action-gh-release@v2
