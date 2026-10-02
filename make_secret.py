@@ -12,4 +12,4 @@ blob = bytes(b ^ pad[i] for i, b in enumerate(raw))
 with open("_cf_secret.py", "w", encoding="utf-8") as f:
     f.write(f'_A = "{base64.b64encode(pad).decode()}"\n')
     f.write(f'_B = "{base64.b64encode(blob).decode()}"\n')
-print("_cf_secret.py written (key not printed).")
+print("_cf_secret.py written.")
