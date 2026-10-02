@@ -1,9 +1,3 @@
-"""
-Build-time helper. Reads the CurseForge key from the CF_API_KEY environment
-variable (a GitHub Actions secret) and writes _cf_secret.py, which PyInstaller
-bundles into the executable. _cf_secret.py is git-ignored; the key is never in
-the repository.
-"""
 import os, sys, base64, secrets
 
 key = os.environ.get("CF_API_KEY", "").strip()
