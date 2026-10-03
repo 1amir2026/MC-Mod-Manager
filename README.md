@@ -22,3 +22,11 @@ MIT License. Free to use, modify, and distribute.
 Made for the Minecraft community.
 
 [Modrinth](https://modrinth.com) · [Fabric](https://fabricmc.net) · [Forge](https://minecraftforge.net) · [NeoForge](https://neoforged.net)
+
+---
+
+[!CAUTION]
+A Windows blue screen is not an important issue for this project. The app is open source, so you can inspect the code and contribute fixes or improvements.
+
+[!TIP]
+You can skip this by simply restarting your PC and opening the app again.
