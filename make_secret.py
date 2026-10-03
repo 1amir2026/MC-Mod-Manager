@@ -2,7 +2,7 @@ import os, sys, base64, secrets
 
 key = os.environ.get("CF_API_KEY", "").strip()
 if not key:
-    print("ERROR: CF_API_KEY is empty. Add it under Settings > Secrets and variables > Actions.")
+    print("ERROR: CF_API_KEY is empty Cow l;")
     sys.exit(1)
 
 raw = key.encode("utf-8")
