@@ -30,7 +30,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-APP_VER    = "5.0.0"
+APP_VER    = "6.0.1"
 MODRINTH   = "https://api.modrinth.com/v2"
 CURSEFORGE = "https://api.curseforge.com/v1"
 LOADERS    = ["Fabric", "Forge", "NeoForge", "Quilt"]
@@ -1584,12 +1584,15 @@ def describe_error(e):
         return "Connection error"
     return type(e).__name__
 
+BAR_FULL  = "\u2588"
+BAR_EMPTY = "\u2591"
+
 def show_progress(done, total):
     if total:
         pct = min(100.0, done / total * 100)
         width = max(10, min(40, LIVE.width() - 38))
         filled = int(pct / 100 * width)
-        line = f"     [{'\u2588' * filled}{'\u2591' * (width - filled)}] {pct:5.1f}%  {fmt_size(done)}/{fmt_size(total)}"
+        line = f"     [{BAR_FULL * filled}{BAR_EMPTY * (width - filled)}] {pct:5.1f}%  {fmt_size(done)}/{fmt_size(total)}"
     else:
         line = f"     {fmt_size(done)} downloaded"
     LIVE.set_progress(line)
