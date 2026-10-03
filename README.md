@@ -1,4 +1,4 @@
-# MC Mod Manager
+# `MC Mod Manager`
 
 **Minecraft Mod Manager - `CLI TOOL`**
 
