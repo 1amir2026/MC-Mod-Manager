@@ -29,5 +29,5 @@ Made for the Minecraft community.
 > A Windows blue screen is not an important issue for this project. The app is open source, so you can inspect the code and contribute fixes or improvements.
 >
 > [!TIP]
-> 
+>  Click On `More Info` Then Click To `Run Anyways`
 
