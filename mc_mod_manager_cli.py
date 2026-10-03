@@ -2,7 +2,7 @@
 1amir2026 GOD lol
 """
 
-import builtins, os, sys, json, time, shutil, hashlib, zipfile, re, platform, struct, threading, traceback, math
+import atexit, bisect, builtins, random, os, sys, json, time, shutil, hashlib, zipfile, re, platform, struct, threading, traceback, math
 from difflib import SequenceMatcher, get_close_matches
 from pathlib import Path
 from datetime import datetime
@@ -229,6 +229,7 @@ class Live:
         self.last_draw = 0.0
         self.stopped_at = None
         self.skipped = 0.0
+        self.word_order = []
         self.lock = threading.RLock()
         self.stop_evt = threading.Event()
         self.thread = None
@@ -248,7 +249,7 @@ class Live:
         return now - self.t0 - self.skipped
 
     def _w(self, text):
-        sys.stdout.write(text)
+        getattr(sys.stdout, "write_plain", sys.stdout.write)(text)
         sys.stdout.flush()
 
     def _lines(self):
@@ -256,8 +257,20 @@ class Live:
         lines = []
         if self.progress:
             lines.append(colorize(self.progress[:w]))
-        lines.append(colorize(f"  [i] [{fmt_dur(self.elapsed())}]"[:w]))
+        lines.append(self._status_line(w))
         return lines
+
+    def _status_line(self, w):
+        head = f"  [{info_icon(self.enabled)}] "
+        tail = f" [{fmt_dur(self.elapsed())}]"
+        if not self.enabled:
+            return colorize((head + tail.lstrip())[:w])
+        if not self.word_order:
+            self.word_order = random.sample(range(len(STATUS_WORDS)), len(STATUS_WORDS))
+        word = STATUS_WORDS[self.word_order[int(self.elapsed() / STATUS_WORD_TIME) % len(self.word_order)]] + "\u2026"
+        if len(head) + 2 + len(word) + len(tail) > w:
+            return colorize((head + tail.lstrip())[:w])
+        return colorize(head) + status_text(word) + colorize(tail)
 
     def _erase(self):
         if not self.drawn:
@@ -280,7 +293,7 @@ class Live:
         self._w(buf)
 
     def _run(self):
-        while not self.stop_evt.wait(0.5):
+        while not self.stop_evt.wait(STATUS_TICK):
             with self.lock:
                 if self.active and self.enabled:
                     self._refresh()
@@ -341,7 +354,10 @@ LIVE = Live()
 
 
 def clr():
-    os.system("cls" if platform.system() == "Windows" else "clear")
+    with ICONS.lock:
+        os.system("cls" if platform.system() == "Windows" else "clear")
+        ICONS.reset()
+    soft_on()
 
 def out(msg=""):
     LIVE.emit(msg)
@@ -366,17 +382,388 @@ def ok(msg):    out(f"  [+] {msg}")
 def warn(msg):  out(f"  [!] {msg}")
 def err(msg):   out(f"  [x] {msg}")
 
+_COLOR = sys.stdout.isatty() and enable_ansi()
+
+SOFT_FG   = "\033[38;5;252m"
+SOFT_HINT = "\033[38;5;222m"
+SOFT_ICON = "\033[38;5;153m"
+RESET     = "\033[0m"
+
+I_FRAMES     = ["i", "\u00ef", "\u0131", "\u00a1", "\u0131", "\u00ef"]
+I_COLORS     = [93, 97, 97, 96, 97, 93]
+I_FRAME_TIME = 0.14
+
+ARROW_REST = " > "
+ARROW_FRAMES = (
+    [ARROW_REST] * 4
+    + [" \u00b7 ", " \u2022 ", " \u25cf ", "(\u25cf)"]
+    + ["-\u25cf-", "\\\u25cf/", "|\u25cf|", "/\u25cf\\"] * 2
+    + ["(\u25cf)", " \u25cf ", " \u2022 ", " \u00b7 "]
+)
+ARROW_FRAME_TIME = 0.08
+
+STATUS_WORDS = [
+    "Harmonizing", "Pondering", "Cogitating", "Noodling", "Simmering", "Percolating",
+    "Synthesizing", "Conjuring", "Untangling", "Marinating", "Reticulating", "Brewing",
+    "Ruminating", "Tinkering", "Mulling", "Calibrating", "Weaving", "Crunching",
+]
+STATUS_WORD_TIME = 3.5
+STATUS_TICK      = 0.09
+STAR_TIME        = 0.12
+STAR_TONE        = "\033[38;5;216m"
+STAR_GLOW        = "\033[38;5;230m"
+TAG_YELLOW       = "\033[93m"
+
+# Brand colors for provider tags (truecolor where supported, 256-color fallback otherwise)
+_TRUECOLOR        = platform.system() == "Windows" or os.environ.get("COLORTERM", "").lower() in ("truecolor", "24bit")
+MODRINTH_GREEN    = "\033[38;2;27;217;106m" if _TRUECOLOR else "\033[38;5;41m"      # #1bd96a
+CURSEFORGE_ORANGE = "\033[38;2;241;100;54m" if _TRUECOLOR else "\033[38;5;202m"     # #f16436
+PROVIDER_COLORS   = {"Modrinth": MODRINTH_GREEN, "CurseForge": CURSEFORGE_ORANGE}
+GRAY_FAINT        = "\033[38;5;240m"
+
+def provider_tag(name):
+    c = PROVIDER_COLORS.get(name)
+    return f"{c}[{name}]{SOFT_FG}" if (_COLOR and c) else f"[{name}]"
+
+# [+] animation: (glyph, ansi color, seconds). Edit the three phases to retune it.
+#   1) slow spin  + x + x +
+#   2) sudden X, spinning speeds up
+#   3) circle, pulsing slows down
+# The full cycle then plays forward, backward, forward... (ping-pong).
+def _plus_cycle():
+    fwd = [(g, 93, 0.22) for g in ("+", "\u00d7", "+", "\u00d7", "+")]
+    for k, d in enumerate((0.14, 0.12, 0.10, 0.08, 0.065, 0.05, 0.04, 0.035, 0.035, 0.035)):
+        fwd.append(("X" if k % 2 == 0 else "+", 97, d))
+    for k, d in enumerate((0.04, 0.05, 0.07, 0.09, 0.12, 0.16, 0.22, 0.30)):
+        fwd.append(("O" if k % 2 == 0 else "o", 96, d))
+    return fwd + fwd[-2:0:-1]
+
+PLUS_CYCLE = _plus_cycle()
+PLUS_ENDS  = []
+_t = 0.0
+for _g, _c, _d in PLUS_CYCLE:
+    _t += _d
+    PLUS_ENDS.append(_t)
+PLUS_TOTAL = _t
+ICON_TICK  = 0.03
+
+def plus_frame(now=None):
+    t = (time.monotonic() if now is None else now) % PLUS_TOTAL
+    return PLUS_CYCLE[min(bisect.bisect_right(PLUS_ENDS, t), len(PLUS_CYCLE) - 1)]
+
+_FANCY_STARS = platform.system() != "Windows" or bool(os.environ.get("WT_SESSION"))
+_STAR_BASE   = ["\u00b7", "\u2722", "*", "\u2736", "\u273b", "\u273d"] if _FANCY_STARS else ["\u00b7", "\u2022", "\u25cf", "*"]
+STAR_FRAMES  = _STAR_BASE + _STAR_BASE[-2:0:-1]
+
+def status_text(word):
+    now = time.monotonic()
+    star = STAR_FRAMES[int(now / STAR_TIME) % len(STAR_FRAMES)]
+    pos = int(now / 0.09) % (len(word) + 6) - 3
+    chars = []
+    for j, ch in enumerate(word):
+        chars.append((STAR_GLOW if abs(j - pos) <= 1 else STAR_TONE) + ch)
+    return f"{STAR_TONE}{star} " + "".join(chars) + SOFT_FG
+
+def soft_on():
+    if _COLOR:
+        sys.stdout.write(SOFT_FG)
+        sys.stdout.flush()
+
+def soft_off():
+    if _COLOR:
+        sys.stdout.write(RESET)
+        sys.stdout.flush()
+
+def info_icon(animated=True):
+    if not animated:
+        return "i"
+    return I_FRAMES[int(time.monotonic() / I_FRAME_TIME) % len(I_FRAMES)]
+
+def yellow(text):
+    return f"{SOFT_HINT}{text}{SOFT_FG}" if _COLOR else text
+
+class ArrowAnim:
+    def __init__(self):
+        self.stop_evt = threading.Event()
+        self.thread = None
+
+    def _run(self):
+        i = 0
+        while not self.stop_evt.is_set():
+            frame = ARROW_FRAMES[i % len(ARROW_FRAMES)]
+            sys.stdout.write(f"\x1b7\x1b[2G{SOFT_ICON}{frame}{SOFT_FG}\x1b8")
+            sys.stdout.flush()
+            i += 1
+            self.stop_evt.wait(ARROW_FRAME_TIME)
+
+    def start(self):
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.stop_evt.set()
+        if self.thread:
+            self.thread.join(timeout=1)
+            self.thread = None
+
 def prompt(text):
+    animate = _COLOR and sys.stdin.isatty()
     try:
-        return input(colorize(f"\n  > {text}")).strip()
+        if not animate:
+            return input(colorize(f"\n  > {text}")).strip()
+        sys.stdout.write(f"\n {SOFT_ICON}{ARROW_REST}{SOFT_FG} {colorize(text)}")
+        sys.stdout.flush()
+        anim = ArrowAnim()
+        anim.start()
+        line0 = ICONS.line
+        ICONS.typing = True
+        try:
+            raw_typed = input()
+        except (KeyboardInterrupt, EOFError):
+            ICONS.typing = False
+            anim.stop()
+            sys.stdout.write(f"\x1b[2G{ARROW_REST}")
+            raise
+        ICONS.typing = False
+        ICONS.typed(raw_typed)
+        typed = raw_typed.strip()
+        anim.stop()
+        sys.stdout.write("\r\x1b[2K")
+        tracked = isinstance(sys.stdout, OutProxy)
+        width = shutil.get_terminal_size((80, 20)).columns
+        rows = max(1, ICONS.line - line0) if tracked else 1
+        if (tracked and rows <= ICONS.srow) or (not tracked and 1 + len(ARROW_REST) + 1 + len(text) + len(typed) + 2 < width):
+            sys.stdout.write(f"\x1b[{rows}A\x1b[2G{ARROW_REST}\x1b[{rows}B\r")
+        sys.stdout.flush()
+        return typed
     except (KeyboardInterrupt, EOFError):
         print()
         sys.exit(0)
 
-_COLOR = sys.stdout.isatty() and enable_ansi()
+_ESC_RE = re.compile(r"\x1b(?:\[([0-9;?]*)([A-Za-z])|([78])|\][^\x07\x1b]*(?:\x07|\x1b\\)|[()][0-9A-Za-z])")
 
-def yellow(text):
-    return f"\033[93m{text}\033[0m" if _COLOR else text
+class IconBoard:
+    def __init__(self):
+        self.raw = None
+        self.lock = threading.RLock()
+        self.typing = False
+        self.stopped = False
+        self.thread = None
+        self.icons = {}
+        self.shown = {}
+        self.width = 80
+        self.height = 24
+        self.reset()
+
+    def reset(self):
+        self.line = 0
+        self.col = 0
+        self.srow = 0
+        self.last = ""
+        self.saved = (0, 0, 0)
+        self.icons.clear()
+        self.shown.clear()
+
+    def _size(self):
+        sz = shutil.get_terminal_size((80, 24))
+        if sz.columns != self.width:
+            self.icons.clear()
+            self.shown.clear()
+            self.width = sz.columns
+        self.height = sz.lines
+
+    def feed(self, s, register=True):
+        self._size()
+        pos = 0
+        for m in _ESC_RE.finditer(s):
+            if m.start() > pos:
+                self._text(s[pos:m.start()], register)
+            pos = m.end()
+            self._esc(m)
+        if pos < len(s):
+            self._text(s[pos:], register)
+
+    def _down(self, n):
+        self.line += n
+        self.srow = min(self.height - 1, self.srow + n)
+
+    def _text(self, t, register):
+        for ch in t:
+            if ch == "\n":
+                self._down(1)
+                self.col = 0
+                self.last = ""
+            elif ch == "\r":
+                self.col = 0
+                self.last = ""
+            elif ch == "\b":
+                self.col = max(0, self.col - 1)
+                self.last = ""
+            elif ch < " ":
+                continue
+            else:
+                if self.col >= self.width:
+                    self._down(1)
+                    self.col = 0
+                    self.last = ""
+                self.icons.pop((self.line, self.col), None)
+                self.shown.pop((self.line, self.col), None)
+                self.last = (self.last + ch)[-3:]
+                if register and self.col >= 1 and self.last in ("[i]", "[+]"):
+                    key = (self.line, self.col - 1)
+                    self.icons[key] = self.last[1]
+                    self.shown.pop(key, None)
+                self.col += 1
+
+    def _esc(self, m):
+        if m.group(3):
+            if m.group(3) == "7":
+                self.saved = (self.line, self.col, self.srow)
+            else:
+                self.line, self.col, self.srow = self.saved
+            self.last = ""
+            return
+        cmd = m.group(2)
+        if cmd is None:
+            return
+        args = m.group(1) or ""
+        try:
+            n = int(args.split(";")[0]) if args and not args.startswith("?") else None
+        except ValueError:
+            n = None
+        k = n if n else 1
+        if cmd == "A":
+            self.line -= k
+            self.srow = max(0, self.srow - k)
+            self.last = ""
+        elif cmd == "B":
+            self._down(k)
+            self.last = ""
+        elif cmd == "C":
+            self.col = min(self.width, self.col + k)
+            self.last = ""
+        elif cmd == "D":
+            self.col = max(0, self.col - k)
+            self.last = ""
+        elif cmd == "G":
+            self.col = min(self.width - 1, max(0, k - 1))
+            self.last = ""
+        elif cmd == "K":
+            mode = n or 0
+            for key in list(self.icons):
+                if key[0] == self.line and (mode == 2 or (mode == 0 and key[1] >= self.col) or (mode == 1 and key[1] <= self.col)):
+                    del self.icons[key]
+        elif cmd == "J":
+            mode = n or 0
+            if mode == 2:
+                self.icons.clear()
+            else:
+                for key in list(self.icons):
+                    if key[0] > self.line or (key[0] == self.line and key[1] >= self.col):
+                        del self.icons[key]
+
+    def typed(self, text):
+        with self.lock:
+            self.feed(text + "\n", register=False)
+
+    def clear_screen(self):
+        with self.lock:
+            self.reset()
+
+    def start(self, raw):
+        self.raw = raw
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def _run(self):
+        while True:
+            time.sleep(ICON_TICK)
+            with self.lock:
+                if self.typing or self.stopped or not self.icons:
+                    continue
+                self._size()
+                now = time.monotonic()
+                idx = int(now / I_FRAME_TIME) % len(I_FRAMES)
+                i_frame = (I_FRAMES[idx], I_COLORS[idx])
+                p_glyph, p_color, _ = plus_frame(now)
+                p_frame = (p_glyph, p_color)
+                parts = []
+                for key, kind in list(self.icons.items()):
+                    ln, col = key
+                    d = self.line - ln
+                    if d < 0 or d >= self.height:
+                        del self.icons[key]
+                        self.shown.pop(key, None)
+                        continue
+                    if d > self.srow or col >= self.width:
+                        continue
+                    frame = p_frame if kind == "+" else i_frame
+                    if self.shown.get(key) == frame:
+                        continue
+                    self.shown[key] = frame
+                    up = f"\x1b[{d}A" if d else ""
+                    down = f"\x1b[{d}B" if d else ""
+                    parts.append(f"{up}\x1b[{col + 1}G\x1b[{frame[1]}m{frame[0]}{down}")
+                if not parts:
+                    continue
+                try:
+                    self.raw.write("\x1b7" + "".join(parts) + f"\x1b8{SOFT_FG}")
+                    self.raw.flush()
+                except Exception:
+                    pass
+
+    def restore(self):
+        with self.lock:
+            self.stopped = True
+            if not self.icons:
+                return
+            self._size()
+            parts = []
+            for (ln, col), kind in list(self.icons.items()):
+                d = self.line - ln
+                if 0 <= d <= self.srow and col < self.width:
+                    up = f"\x1b[{d}A" if d else ""
+                    down = f"\x1b[{d}B" if d else ""
+                    parts.append(f"{up}\x1b[{col + 1}G{TAG_YELLOW}{kind}{down}")
+            if parts:
+                try:
+                    self.raw.write("\x1b7" + "".join(parts) + f"\x1b8{RESET}")
+                    self.raw.flush()
+                except Exception:
+                    pass
+
+ICONS = IconBoard()
+
+class OutProxy:
+    def __init__(self, raw):
+        object.__setattr__(self, "_raw", raw)
+
+    def write(self, s):
+        with ICONS.lock:
+            n = self._raw.write(s)
+            ICONS.feed(s)
+            return n
+
+    def write_plain(self, s):
+        with ICONS.lock:
+            n = self._raw.write(s)
+            ICONS.feed(s, register=False)
+            return n
+
+    def flush(self):
+        with ICONS.lock:
+            return self._raw.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._raw, name)
+
+def install_info_anim():
+    if not _COLOR or isinstance(sys.stdout, OutProxy):
+        return
+    raw = sys.stdout
+    sys.stdout = OutProxy(raw)
+    ICONS.start(raw)
+    atexit.register(ICONS.restore)
 
 _BRACKET = re.compile(r"\[[^\[\]\x1b]*\]")
 
@@ -384,7 +771,7 @@ def colorize(text):
     """Makes every [bracketed] tag yellow (only on terminals that support colors)."""
     if not _COLOR or not isinstance(text, str) or "\x1b" in text:
         return text
-    return _BRACKET.sub(lambda m: f"\x1b[93m{m.group(0)}\x1b[0m", text)
+    return _BRACKET.sub(lambda m: f"\x1b[93m{m.group(0)}{SOFT_FG}", text)
 
 _builtin_print = builtins.print
 
@@ -814,12 +1201,13 @@ class Http:
 
 class Provider:
     name = ""
+    progressive = False  # True = prefetch() reports per-mod progress via its callback
 
     def __init__(self, http):
         self.http = http
         self.enabled = True
 
-    def prefetch(self, mods):
+    def prefetch(self, mods, progress=None):
         return 0
 
     def hash_candidates(self, mod):
@@ -918,21 +1306,22 @@ class ModrinthProvider(Provider):
                 "1.20.1", "1.20", "1.19.4", "1.19.2", "1.19", "1.18.2",
                 "1.18", "1.17.1", "1.16.5", "1.15.2", "1.14.4", "1.12.2", "1.8.9"]
 
-    def prefetch(self, mods):
-        by_hash = {m.sha512: m for m in mods if m.sha512}
-        hashes = list(by_hash)
+    progressive = True
+
+    def prefetch(self, mods, progress=None):
         matched = 0
-        for i in range(0, len(hashes), 200):
-            chunk = hashes[i:i + 200]
-            data = self.http.json("POST", f"{MODRINTH}/version_files",
-                                  body={"hashes": chunk, "algorithm": "sha512"})
-            if not isinstance(data, dict):
-                continue
-            for h, v in data.items():
-                m = by_hash.get(h.lower())
-                if m and v.get("project_id"):
+        for i, m in enumerate(mods):
+            if m.sha512:
+                v = self.http.json("GET", f"{MODRINTH}/version_file/{m.sha512}",
+                                   params={"algorithm": "sha512"})
+                if isinstance(v, dict) and v.get("project_id"):
                     m.hits[self.name] = {"pid": v["project_id"], "version": v.get("version_number", "")}
                     matched += 1
+                    LOG.debug(f"[{self.name}] hash hit: {m.filename} -> {v['project_id']}")
+                else:
+                    LOG.debug(f"[{self.name}] hash miss: {m.filename}")
+            if progress:
+                progress(matched, mods[i + 1].filename if i + 1 < len(mods) else None)
         return matched
 
     def _project(self, ref):
@@ -1047,7 +1436,7 @@ class CurseForgeProvider(Provider):
             return "ok"
         return "invalid" if r.status_code in (401, 403) else "error"
 
-    def prefetch(self, mods):
+    def prefetch(self, mods, progress=None):
         by_fp = {}
         total = len(mods)
         for i, m in enumerate(mods, 1):
@@ -1200,7 +1589,7 @@ def show_progress(done, total):
         pct = min(100.0, done / total * 100)
         width = max(10, min(40, LIVE.width() - 38))
         filled = int(pct / 100 * width)
-        line = f"     [{'#' * filled}{'-' * (width - filled)}] {pct:5.1f}%  {fmt_size(done)}/{fmt_size(total)}"
+        line = f"     [{'\u2588' * filled}{'\u2591' * (width - filled)}] {pct:5.1f}%  {fmt_size(done)}/{fmt_size(total)}"
     else:
         line = f"     {fmt_size(done)} downloaded"
     LIVE.set_progress(line)
@@ -1249,6 +1638,38 @@ def download_file(sess, url, dest, expected_hash="", algo="", expected_size=0):
                 os.remove(part)
             except OSError:
                 pass
+
+
+class HashBoard:
+    """Live 2-line block: animated '[+] Name: n/N ...' counter + faint gray '[+] Checking file.jar'."""
+
+    def __init__(self, provider, total):
+        self.provider = provider
+        self.total = total
+        self.live = _COLOR
+        self.drawn = False
+
+    def _counter(self, n):
+        w = max(20, shutil.get_terminal_size((80, 20)).columns - 1)
+        return colorize(f"  [+] {self.provider}: {n}/{self.total} jar(s) recognized by file hash."[:w])
+
+    def update(self, n, current=None):
+        if not self.live:
+            return
+        w = max(20, shutil.get_terminal_size((80, 20)).columns - 1)
+        up = "\x1b[1A" if self.drawn else ""
+        plain = getattr(sys.stdout, "write_plain", sys.stdout.write)
+        sys.stdout.write(f"{up}\r\x1b[2K{self._counter(n)}{SOFT_FG}\r\n")
+        plain(f"\x1b[2K{GRAY_FAINT}{f'  [+] Checking {current}'[:w] if current else ''}{SOFT_FG}")
+        sys.stdout.flush()
+        self.drawn = True
+
+    def finish(self, n):
+        if self.live and self.drawn:
+            sys.stdout.write(f"\r\x1b[2K\x1b[1A\r\x1b[2K{self._counter(n)}{SOFT_FG}\r\n")
+            sys.stdout.flush()
+        else:
+            ok(f"{self.provider}: {n}/{self.total} jar(s) recognized by file hash.")
 
 
 class App:
@@ -1482,8 +1903,14 @@ class App:
         LOG.section("EXACT FILE LOOKUP")
         for p in self.providers:
             info(f"Looking up exact file matches on {p.name}...")
-            n = p.prefetch(self.mods)
-            ok(f"{p.name}: {n}/{len(self.mods)} jar(s) recognized by file hash.")
+            if p.progressive:
+                board = HashBoard(p.name, len(self.mods))
+                board.update(0, self.mods[0].filename)
+                n = p.prefetch(self.mods, progress=board.update)
+                board.finish(n)
+            else:
+                n = p.prefetch(self.mods)
+                ok(f"{p.name}: {n}/{len(self.mods)} jar(s) recognized by file hash.")
             LOG.info(f"{p.name} exact matches: {n}/{len(self.mods)}")
         print()
 
@@ -1557,11 +1984,11 @@ class App:
     def _status_text(self, m):
         f = m.found
         if m.status == "up_to_date":
-            return f"  up-to-date ({m.version or f.version}) [{f.provider}]"
+            return f"  up-to-date ({m.version or f.version}) {provider_tag(f.provider)}"
         if m.status == "available":
             extra = "" if f.channel == "release" else f" ({f.channel})"
             manual = " manual download only" if f.manual else ""
-            return f"  update available -> {f.version}{extra} [{f.provider}]{manual}"
+            return f"  update available -> {f.version}{extra} {provider_tag(f.provider)}{manual}"
         if m.status == "no_build":
             return f"  no build for {self.ver}/{self.loader} (found: {m.no_build[1]})"
         hint = f" (closest: {m.closest[1]}, {m.closest[2]:.2f})" if m.closest and m.closest[2] >= 0.45 else ""
@@ -1856,6 +2283,9 @@ class App:
 
 def main():
     smooth_console()
+    install_info_anim()
+    atexit.register(soft_off)
+    soft_on()
     try:
         App().run()
     except KeyboardInterrupt:
